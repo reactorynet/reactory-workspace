@@ -112,9 +112,10 @@ repo fully compliant; the stale protection on
 day this repository itself was published as the private
 `reactorynet/reactory-workspace`, hardened and seeded (`CODEOWNERS`,
 `SECURITY.md`, an Actions-only `dependabot.yml`; CodeQL and the other
-workflows are public-only). Arming auto-merge on a private repo without
-branch protection merges the PR at once, which is how the workspace,
-`reactory-communicator` and `reactory-classroom` baselines landed; the
+workflows are public-only). GitHub refuses auto-merge on private Free-plan
+repos, but `gh pr merge --auto` merges a PR that is already mergeable on
+the spot, which is how the workspace, `reactory-communicator` and
+`reactory-classroom` baselines landed without a review; the
 remaining private ones (`reactor-express-client-config`,
 `booktutor-express-client-config`, `reactor-system-navigator`) were left for
 a human to merge. Two private repos
