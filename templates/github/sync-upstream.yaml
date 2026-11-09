@@ -1,0 +1,102 @@
+# Optional, ENTERPRISE (mirror) side only: copy into each mirror repo's .github/workflows/.
+#
+# Opens a pull request that brings github.com/reactorynet/<repo>@master into this
+# mirror's `main` whenever upstream has moved. reactorynet platform repos are
+# public, so no cross-org secret is needed to *read* them; the PR is created with
+# the default GITHUB_TOKEN. The PR is armed with auto-merge using a MERGE COMMIT:
+# it lands once the code-owner review and the required checks pass, and the
+# sync/ branch is deleted on merge (delete_branch_on_merge). Never squash or
+# rebase a sync PR: that forks the mirror from upstream (reactory-repos cleanup
+# and the next sync recover, but with an empty re-linking merge).
+#
+# Runner note: this runs on GitHub-hosted ubuntu-latest, so it needs no change
+# to an organisation's self-hosted runner allow-list. Private upstream repos
+# would need a read-only deploy key stored as UPSTREAM_SSH_KEY; wire that in
+# before enabling it for them. Set PR_TITLE_PREFIX to your tracker key if the
+# organisation requires one in PR titles.
+#
+# Developer-driven equivalent: bin/reactory-repos sync --to <org> --pr
+name: Sync upstream (reactorynet)
+
+on:
+  schedule:
+    - cron: "17 5 * * 1-5"   # weekdays 05:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_ORG: reactorynet
+  UPSTREAM_BRANCH: master
+  TARGET_BRANCH: main
+  # Paths that belong to this org only. Whatever upstream has for them is ignored.
+  # List every file your organisation injects into repositories (same list as
+  # org_specific_paths in the enterprise profile).
+  ORG_SPECIFIC_PATHS: >-
+    .github/CODEOWNERS .github/dependabot.yml .github/workflows/ci.yaml
+    .github/workflows/sync-upstream.yaml catalog-info.yaml
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_ORG}/${GITHUB_REPOSITORY#*/}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+      - name: Anything to sync?
+        id: diff
+        run: |
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "count=$(git rev-list --count HEAD..upstream/${UPSTREAM_BRANCH})" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream on a sync branch
+        if: steps.diff.outputs.changed == 'true'
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "reactory-sync[bot]"
+          git config user.email "reactory-sync@users.noreply.github.com"
+          BRANCH="sync/reactorynet-${UPSTREAM_BRANCH}-$(date -u +%Y%m%dT%H%M)"
+          git checkout -b "$BRANCH"
+          git merge --no-ff --no-commit --no-edit "upstream/${UPSTREAM_BRANCH}" || true
+          for p in $ORG_SPECIFIC_PATHS; do
+            if git cat-file -e "${TARGET_BRANCH}:$p" 2>/dev/null; then
+              git checkout "${TARGET_BRANCH}" -- "$p"
+            else
+              git rm -rq --ignore-unmatch --force -- "$p" || true
+              rm -rf -- "$p"
+            fi
+          done
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            echo "::error::merge conflicts in: $(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+            exit 1
+          fi
+          git commit -q -m "Sync ${UPSTREAM_ORG}@${UPSTREAM_BRANCH} into ${TARGET_BRANCH} (${{ steps.diff.outputs.count }} commits)"
+          git push origin "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr create \
+            --base "${TARGET_BRANCH}" --head "${{ steps.merge.outputs.branch }}" \
+            --title "${PR_TITLE_PREFIX}Sync ${UPSTREAM_ORG}/${GITHUB_REPOSITORY#*/}@${UPSTREAM_BRANCH} (${{ steps.diff.outputs.count }} commits)" \
+            --body "Automated upstream sync. **Merge with a merge commit**, never squash or rebase, so the mirror and upstream keep a common ancestor. Org-specific paths were kept from \`${TARGET_BRANCH}\`. Auto-merge (merge commit) is armed; the branch is deleted on merge."
+          # auto-merge needs allow_auto_merge on the repo definition and a protected base branch
+          gh pr merge "${{ steps.merge.outputs.branch }}" --auto --merge \
+            || echo "::warning::auto-merge not armed; merge the PR by hand WITH A MERGE COMMIT"

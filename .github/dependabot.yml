@@ -1,0 +1,10 @@
+# Managed by reactory-workspace `seed` (policy: public-upstream). Edits are
+# overwritten on the next seed; change the template instead.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+

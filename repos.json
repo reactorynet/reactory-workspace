@@ -1,0 +1,374 @@
+{
+  "description": "Reactory multi-repo inventory: every git repository that makes up a Reactory checkout, where it lives on disk, and the upstream organisation that owns it. Enterprise mirrors are declared in profiles/<name>.json.",
+  "// profiles": "Enterprise profiles live in enterprises/<name>/profile.json (separate, gitignored repos); select with --profile or REACTORY_PROFILE. A single present enterprise is selected automatically.",
+  "workspace_root_env": "REACTORY_HOME",
+  "upstream_org": {
+    "key": "reactorynet",
+    "github_org": "reactorynet",
+    "remote": "reactorynet",
+    "default_branch": "master",
+    "protected_default_branch": true,
+    "// protected": "Default branch protected by policies/public-upstream.json: sync into it goes through a sync/ branch and a PR, never a direct push.",
+    "policy": "policies/public-upstream.json",
+    "pr_title_prefix": "",
+    "org_specific_paths": [
+      "SECURITY.md",
+      ".github/dependabot.yml",
+      ".github/workflows/codeql.yml",
+      ".github/workflows/dependency-review.yml",
+      ".github/workflows/scorecard.yml"
+    ]
+  },
+  "groups": {
+    "platform": "Required to build and deploy the Reactory server + PWA client",
+    "tenants": "reactorynet tenant configurations",
+    "optional": "Not needed for a deployment of the platform",
+    "tooling": "Workspace tooling: not part of a deployment, upstream-only"
+  },
+  "repos": [
+    {
+      "name": "reactory-express-server",
+      "path": "reactory-express-server",
+      "kind": "root",
+      "groups": [
+        "platform"
+      ],
+      "description": "Reactory platform server: Express + Apollo GraphQL, module system, workflow engine, CDN",
+      "has_dockerfile": true
+    },
+    {
+      "name": "reactory-express-server-devops",
+      "path": "reactory-express-server/config/reactory",
+      "kind": "submodule",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "description": "Reactory server devops: Dockerfile, compose files, env samples, terraform",
+      "has_dockerfile": true
+    },
+    {
+      "name": "reactory-pwa-client",
+      "path": "reactory-pwa-client",
+      "kind": "root",
+      "groups": [
+        "platform"
+      ],
+      "description": "Reactory web client: React PWA driven by server configuration and the plugin API",
+      "has_dockerfile": true
+    },
+    {
+      "name": "reactory-client-core-pwa-plugin",
+      "path": "reactory-pwa-client/src/components/plugins/reactory-core",
+      "kind": "submodule",
+      "parent": "reactory-pwa-client",
+      "groups": [
+        "platform"
+      ],
+      "description": "Reactory PWA core plugin (component registry entries compiled into the client)"
+    },
+    {
+      "name": "reactory-telemetry-pwa-plugin",
+      "path": "reactory-pwa-client/src/components/plugins/reactory-telemetry",
+      "kind": "nested",
+      "parent": "reactory-pwa-client",
+      "groups": [
+        "platform"
+      ],
+      "description": "Reactory PWA telemetry plugin"
+    },
+    {
+      "name": "reactory-core",
+      "path": "reactory-core",
+      "kind": "root",
+      "groups": [
+        "platform"
+      ],
+      "description": "Reactory shared types and definitions, published to npm as @reactorynet/reactory-core"
+    },
+    {
+      "name": "reactory-data",
+      "path": "reactory-data",
+      "kind": "root",
+      "groups": [
+        "platform"
+      ],
+      "description": "Reactory data / CDN folder structure: themes, plugins, content, i18n, assets"
+    },
+    {
+      "name": "reactory-client-core-plugin",
+      "path": "reactory-data/plugins/reactory-client-core",
+      "kind": "nested",
+      "parent": "reactory-data",
+      "groups": [
+        "platform"
+      ],
+      "description": "Reactory runtime client core plugin (served from the CDN)"
+    },
+    {
+      "name": "reactory-workflow-es",
+      "path": "reactory-workflow-es",
+      "kind": "root",
+      "groups": [
+        "platform"
+      ],
+      "description": "Reactory fork of workflow-es, packaged as lib/workflow-es tgz for the server"
+    },
+    {
+      "name": "reactory-docs",
+      "path": "reactory-docs",
+      "kind": "root",
+      "groups": [
+        "optional"
+      ],
+      "description": "Reactory platform documentation"
+    },
+    {
+      "name": "reactory-express-server-telemetry",
+      "path": "reactory-express-server/src/modules/reactory-telemetry",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-telemetry",
+      "description": "Reactory server module: telemetry / OpenTelemetry, Grafana and Prometheus assets"
+    },
+    {
+      "name": "reactory-azure",
+      "path": "reactory-express-server/src/modules/reactory-azure",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-azure",
+      "description": "Reactory server module: Azure / Microsoft Graph integration"
+    },
+    {
+      "name": "reactory-reactor",
+      "path": "reactory-express-server/src/modules/reactory-reactor",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-reactor",
+      "description": "Reactory server module: Reactor AI agents and personas"
+    },
+    {
+      "name": "reactory-queue",
+      "path": "reactory-express-server/src/modules/reactory-queue",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-queue",
+      "description": "Reactory server module: queue processing"
+    },
+    {
+      "name": "reactory-slack",
+      "path": "reactory-express-server/src/modules/reactory-slack",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-slack",
+      "description": "Reactory server module: Slack integration"
+    },
+    {
+      "name": "reactory-kyc",
+      "path": "reactory-express-server/src/modules/reactory-kyc",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-kyc",
+      "description": "Reactory server module: KYC / identity verification"
+    },
+    {
+      "name": "reactory-communicator",
+      "path": "reactory-express-server/src/modules/reactory-communicator",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-communicator",
+      "description": "Reactory server module: communicator (email / sms / notifications)"
+    },
+    {
+      "name": "reactory-kb",
+      "path": "reactory-express-server/src/modules/reactory-kb",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-kb",
+      "description": "Reactory server module: knowledge base"
+    },
+    {
+      "name": "reactory-classroom",
+      "path": "reactory-express-server/src/modules/reactory-classroom",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-classroom",
+      "description": "Reactory server module: classroom / education"
+    },
+    {
+      "name": "reactory-socialeyes",
+      "path": "reactory-express-server/src/modules/reactory-socialeyes",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-socialeyes",
+      "description": "Reactory server module: social media monitoring"
+    },
+    {
+      "name": "reactory-pdf-manager",
+      "path": "reactory-express-server/src/modules/reactory-pdf-manager",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-pdf-manager",
+      "description": "Reactory server module: PDF generation and management"
+    },
+    {
+      "name": "reactory-google",
+      "path": "reactory-express-server/src/modules/reactory-google",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-google",
+      "description": "Reactory server module: Google integration"
+    },
+    {
+      "name": "reactory-speech",
+      "path": "reactory-express-server/src/modules/reactory-speech",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-speech",
+      "description": "Reactory server module: speech-to-text / text-to-speech"
+    },
+    {
+      "name": "reactory-temporal",
+      "path": "reactory-express-server/src/modules/reactory-temporal",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-temporal",
+      "description": "Reactory server module: Temporal workflow integration"
+    },
+    {
+      "name": "reactor-express-client-config",
+      "path": "reactory-express-server/src/data/clientConfigs/reactor",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "tenants"
+      ],
+      "client_key": "reactor",
+      "description": "reactorynet tenant config: Reactor"
+    },
+    {
+      "name": "booktutor-express-client-config",
+      "path": "reactory-express-server/src/data/clientConfigs/booktutor",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "tenants"
+      ],
+      "client_key": "booktutor",
+      "description": "reactorynet tenant config: BookTutor"
+    },
+    {
+      "name": "reactory-student-app-express-config",
+      "path": "reactory-express-server/src/data/clientConfigs/student-life",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "tenants"
+      ],
+      "client_key": "student-life",
+      "description": "reactorynet tenant config: Student Life"
+    },
+    {
+      "name": "reactory-marketing-website",
+      "path": "reactory-data/content/static-content/reactory-marketing-website",
+      "kind": "nested",
+      "parent": "reactory-data",
+      "groups": [
+        "optional"
+      ],
+      "description": "reactory.net marketing site static content"
+    },
+    {
+      "name": "reactory-native",
+      "path": "reactory-native",
+      "kind": "root",
+      "groups": [
+        "optional"
+      ],
+      "description": "React Native mobile client"
+    },
+    {
+      "name": "reactory-electron",
+      "path": "reactory-electron",
+      "kind": "root",
+      "groups": [
+        "optional"
+      ],
+      "description": "Electron desktop wrapper"
+    },
+    {
+      "name": "reactory-speech-service",
+      "path": "reactory-speech",
+      "kind": "root",
+      "groups": [
+        "optional"
+      ],
+      "description": "Standalone speech service"
+    },
+    {
+      "name": "reactor-system-navigator",
+      "path": "reactor-system-navigator",
+      "kind": "root",
+      "groups": [
+        "optional"
+      ],
+      "description": "Reactor system navigator"
+    },
+    {
+      "name": "reactory-workspace",
+      "path": "reactory-workspace",
+      "kind": "root",
+      "groups": [
+        "tooling"
+      ],
+      "description": "Configuration-driven multi-org tooling for the Reactory repos: inventory, enterprise profiles, sync, provisioning, GitHub security policy (audit/harden/seed), branch cleanup",
+      "package_ecosystems": [],
+      "codeql_languages": [
+        "python"
+      ],
+      "note": "Stdlib Python; no package manifest, so Dependabot only watches GitHub Actions"
+    }
+  ]
+}

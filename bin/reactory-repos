@@ -1,0 +1,1826 @@
+#!/usr/bin/env python3
+"""
+reactory-repos: manage a multi-repository platform that is mirrored between an
+upstream GitHub organisation and one or more enterprise organisations.
+
+Configuration, not code, decides the topology:
+
+    repos.json             the platform inventory: every repo, its on-disk path,
+                           kind (root / submodule / nested), groups, upstream org
+    enterprises/<name>/    one git repository PER ENTERPRISE, nested here and
+                           gitignored (like the server's src/modules): profile.json
+                           (mirror org(s), protection, org-owned paths, mirrored
+                           groups, enterprise-native repos, provisioning template),
+                           lock.json (written by `lock`), its templates and docs.
+                           `enterprise add <git-url>` clones one, `enterprise init`
+                           creates one from templates/enterprise/. This repository
+                           itself never names an enterprise.
+    locks/upstream.lock.json  pinned commits when no enterprise is selected
+    policies/<name>.json   GitHub security policy for an org (branch protection,
+                           scanning, Actions permissions, baseline files); used by
+                           `audit`, `harden` and `seed`
+
+Pull requests the tool opens (`push --pr`, `sync --pr`, `bootstrap --pr`,
+`seed --pr`) are armed with GitHub auto-merge: sync/import PRs with a merge
+commit (the two histories must keep a common ancestor), everything else
+squashed; the head branch is deleted on merge by the repository setting and
+`cleanup` removes whatever is left over.
+
+Every repository gets one named remote per organisation (the upstream key and
+each enterprise org key) plus `origin`, which duplicates the *primary* org so
+that plain git, the platform's own bin/*.sh scripts and relative submodule URLs
+keep working. Cross-org actions always name the org explicitly (`push --to <org>`).
+
+Only the Python standard library is used.  Python >= 3.9.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+HERE = Path(__file__).resolve().parent
+TOOL_ROOT = HERE.parent
+INVENTORY = TOOL_ROOT / "repos.json"
+ENTERPRISES_DIR = TOOL_ROOT / "enterprises"            # gitignored: one nested repo per enterprise
+ENTERPRISE_TEMPLATE_DIR = TOOL_ROOT / "templates" / "enterprise"
+LOCKS_DIR = TOOL_ROOT / "locks"                        # upstream-only lock when no enterprise is active
+POLICIES_DIR = TOOL_ROOT / "policies"
+DEFAULT_CLEANUP_PREFIXES = ["sync/", "security/", "import/"]   # branches the tool itself creates
+
+# ----------------------------------------------------------------------------
+# output helpers
+# ----------------------------------------------------------------------------
+IS_TTY = sys.stdout.isatty()
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def c(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if IS_TTY else s
+
+
+def ok(s: str) -> str: return c("32", s)
+def warn(s: str) -> str: return c("33", s)
+def err(s: str) -> str: return c("31", s)
+def dim(s: str) -> str: return c("2", s)
+def bold(s: str) -> str: return c("1", s)
+
+
+def pad(txt: str, w: int) -> str:
+    return txt + " " * max(0, w - len(ANSI.sub("", txt)))
+
+
+def run(args: List[str], cwd: Optional[Path] = None, check: bool = True,
+        capture: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(args, cwd=str(cwd) if cwd else None, check=check, text=True, capture_output=capture)
+
+
+def git(repo_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return run(["git", "-C", str(repo_dir), *args], check=check)
+
+
+def git_out(repo_dir: Path, *args: str) -> str:
+    return git(repo_dir, *args).stdout.strip()
+
+
+def git_ok(repo_dir: Path, *args: str) -> bool:
+    return git(repo_dir, *args, check=False).returncode == 0
+
+
+def last_line(s: str) -> str:
+    s = s.strip()
+    return s.splitlines()[-1] if s else "?"
+
+
+def load_jsonc(path: Path) -> dict:
+    """JSON with `//` line comments and `"// key"` comment entries allowed."""
+    text = "\n".join(l for l in path.read_text().splitlines() if not l.lstrip().startswith("//"))
+    return json.loads(text)
+
+
+# ----------------------------------------------------------------------------
+# configuration model
+# ----------------------------------------------------------------------------
+class Org:
+    def __init__(self, key: str, data: dict, role: str):
+        self.key = key
+        self.role = role  # upstream | mirror
+        self.github_org: str = data["github_org"]
+        self.remote: str = data.get("remote", key)
+        self.default_branch: str = data.get("default_branch", "main")
+        self.protected: bool = bool(data.get("protected_default_branch", role == "mirror"))
+        self.org_specific_paths: List[str] = list(data.get("org_specific_paths", []))
+        self.pr_title_prefix: str = data.get("pr_title_prefix", "")
+        self.merge_strategy: str = data.get("merge_strategy", "merge-commit")
+        # How PRs the tool opens are merged. Sync / import PRs use `merge_strategy` (a merge commit keeps the
+        # cross-org ancestry); feature and seed PRs use `pr_merge_method` (squash). `auto_merge` lets GitHub
+        # perform the merge as soon as reviews and checks pass; the head branch is then removed by the repo's
+        # delete_branch_on_merge setting. `cleanup_branch_prefixes` are deleted by `cleanup` once merged.
+        self.sync_merge_method: str = {"merge-commit": "merge", "merge": "merge", "squash": "squash",
+                                       "rebase": "rebase"}.get(self.merge_strategy, "merge")
+        self.pr_merge_method: str = data.get("pr_merge_method", "squash")
+        self.auto_merge: bool = bool(data.get("auto_merge", True))
+        self.cleanup_prefixes: List[str] = list(data.get("cleanup_branch_prefixes", DEFAULT_CLEANUP_PREFIXES))
+        self.provisioning: Optional[dict] = data.get("provisioning")
+        self.ssh_host: str = data.get("ssh_host", "github.com")
+        self.https_host: str = data.get("https_host", "github.com")
+        self.policy_path: Optional[str] = data.get("policy")
+
+    def url(self, repo_name: str, https: bool = False) -> str:
+        if https:
+            return f"https://{self.https_host}/{self.github_org}/{repo_name}.git"
+        return f"git@{self.ssh_host}:{self.github_org}/{repo_name}.git"
+
+
+class Repo:
+    def __init__(self, data: dict, orgs: Dict[str, Org], root: Path, upstream_key: str,
+                 mirror_keys: List[str], native_org: Optional[str] = None):
+        self.name: str = data["name"]
+        self.rel_path: str = data["path"]
+        self.path: Path = root / self.rel_path
+        self.kind: str = data.get("kind", "root")
+        self.parent: Optional[str] = data.get("parent")
+        self.groups: List[str] = list(data.get("groups", [])) or (["native"] if native_org else [])
+        self.description: str = data.get("description", "")
+        self.note: str = data.get("note", "")
+        self.has_dockerfile: bool = bool(data.get("has_dockerfile", False))
+        # what Dependabot and CodeQL should look at (seed templates); defaults fit the JS/TS platform repos
+        self.package_ecosystems: List[str] = list(data.get("package_ecosystems", ["npm"]))
+        self.codeql_languages: List[str] = list(data.get("codeql_languages", ["javascript-typescript"]))
+        self.required_checks: List[str] = list(data.get("required_checks", []))
+        self.module_key: Optional[str] = data.get("module_key")
+        self.client_key: Optional[str] = data.get("client_key")
+        self.native_org: Optional[str] = native_org
+        # org key -> repo name in that org, or None when it does not exist there
+        self.org_names: Dict[str, Optional[str]] = {}
+        self.branches: Dict[str, str] = {}
+        if native_org:
+            self.org_names = {k: None for k in orgs}
+            self.org_names[native_org] = None if data.get("no_repo") else data.get("repo_name", self.name)
+            self.branches[native_org] = data.get("default_branch", orgs[native_org].default_branch)
+        else:
+            self.org_names[upstream_key] = data.get("upstream_name", self.name)
+            self.branches[upstream_key] = data.get("upstream_branch", orgs[upstream_key].default_branch)
+            for mk in mirror_keys:
+                self.org_names[mk] = self.name
+                self.branches[mk] = orgs[mk].default_branch
+        for k, v in (data.get("orgs") or {}).items():        # explicit per-org overrides
+            if k in orgs:
+                self.org_names[k] = v
+        for k, v in (data.get("branches") or {}).items():
+            if k in orgs:
+                self.branches[k] = v
+
+    def in_org(self, org: str) -> bool:
+        return self.org_names.get(org) is not None
+
+    def repo_name_in(self, org: str) -> Optional[str]:
+        return self.org_names.get(org)
+
+    def branch_in(self, org: str) -> str:
+        return self.branches.get(org, "main")
+
+    @property
+    def exists(self) -> bool:
+        return (self.path / ".git").exists()
+
+    @property
+    def is_plain_dir(self) -> bool:
+        return self.path.exists() and not (self.path / ".git").exists()
+
+    def first_org(self, preferred: str) -> Optional[str]:
+        if self.in_org(preferred):
+            return preferred
+        return next((k for k in self.org_names if self.in_org(k)), None)
+
+
+def discover_enterprises() -> Dict[str, Path]:
+    """Enterprise configuration repos nested under enterprises/<name>/ (each has a profile.json)."""
+    if not ENTERPRISES_DIR.is_dir():
+        return {}
+    return {d.name: d for d in sorted(ENTERPRISES_DIR.iterdir()) if (d / "profile.json").is_file()}
+
+
+class Workspace:
+    def __init__(self, inventory_path: Path, profile_name: Optional[str], root_override: Optional[str]):
+        self.inventory_path = inventory_path
+        inv = load_jsonc(inventory_path)
+        env_name = inv.get("workspace_root_env", "REACTORY_HOME")
+        root = root_override or os.environ.get(env_name) or str(inventory_path.parent.parent)
+        self.root = Path(root).expanduser().resolve()
+        self.groups: Dict[str, str] = inv.get("groups", {})
+
+        up = inv["upstream_org"]
+        self.upstream_key: str = up["key"]
+        self.orgs: Dict[str, Org] = {self.upstream_key: Org(self.upstream_key, up, "upstream")}
+
+        self.enterprises: Dict[str, Path] = discover_enterprises()
+        if profile_name is None:
+            profile_name = (os.environ.get("REACTORY_PROFILE") or inv.get("default_profile")
+                            or (next(iter(self.enterprises)) if len(self.enterprises) == 1 else None))
+        self.profile_name = profile_name or None          # "" / "none" => upstream only
+        if self.profile_name in ("none", "upstream"):
+            self.profile_name = None
+        self.profile: dict = {}
+        self.profile_dir: Optional[Path] = None
+        if self.profile_name:
+            self.profile_dir = self.enterprises.get(self.profile_name, ENTERPRISES_DIR / self.profile_name)
+            ppath = self.profile_dir / "profile.json"
+            if not ppath.exists():
+                known = ", ".join(self.enterprises) or "none"
+                sys.exit(err(f"enterprise '{self.profile_name}' not found: expected {ppath} (known: {known}). "
+                             f"`enterprise add <git-url>` clones one, `enterprise init <name>` creates one."))
+            self.profile = load_jsonc(ppath)
+            for key, data in self.profile.get("orgs", {}).items():
+                self.orgs[key] = Org(key, data, "mirror")
+        self.mirror_keys: List[str] = [k for k, o in self.orgs.items() if o.role == "mirror"]
+
+        self.primary_key: str = os.environ.get("REACTORY_PRIMARY_ORG") or self.profile.get("primary_org") or self.upstream_key
+        if self.primary_key not in self.orgs:
+            sys.exit(err(f"primary org '{self.primary_key}' is not defined (known: {', '.join(self.orgs)})"))
+
+        include_groups = set(self.profile.get("include_groups", []))
+        exclude_repos = set(self.profile.get("exclude_repos", []))
+        self.repos: List[Repo] = []
+        for data in inv["repos"]:
+            mirrored = bool(include_groups & set(data.get("groups", []))) and data["name"] not in exclude_repos
+            self.repos.append(Repo(data, self.orgs, self.root, self.upstream_key, self.mirror_keys if mirrored else []))
+        for data in self.profile.get("extra_repos", []):
+            org = data.get("org") or (self.mirror_keys[0] if self.mirror_keys else None)
+            if org not in self.orgs:
+                sys.exit(err(f"extra repo {data['name']} names unknown org '{org}'"))
+            self.repos.append(Repo(data, self.orgs, self.root, self.upstream_key, [], native_org=org))
+
+    @property
+    def upstream(self) -> Org:
+        return self.orgs[self.upstream_key]
+
+    @property
+    def primary(self) -> Org:
+        return self.orgs[self.primary_key]
+
+    def org(self, key: str) -> Org:
+        if key not in self.orgs:
+            sys.exit(err(f"unknown org '{key}'. Known: {', '.join(self.orgs)}"))
+        return self.orgs[key]
+
+    def source_for(self, target: Org, explicit: Optional[str]) -> Org:
+        """Which org feeds a sync into `target`."""
+        if explicit:
+            return self.org(explicit)
+        if target.role == "mirror":
+            return self.upstream
+        if len(self.mirror_keys) == 1:
+            return self.orgs[self.mirror_keys[0]]
+        sys.exit(err(f"several mirror orgs ({', '.join(self.mirror_keys)}); pass --from <org>"))
+
+    def select(self, names: List[str], groups: List[str], include_missing: bool = True) -> List[Repo]:
+        out = []
+        for r in self.repos:
+            if names and r.name not in names and r.rel_path not in names:
+                continue
+            if groups and not any(g in r.groups for g in groups):
+                continue
+            if not include_missing and not r.exists:
+                continue
+            out.append(r)
+        if names:
+            known = {r.name for r in self.repos} | {r.rel_path for r in self.repos}
+            for n in names:
+                if n not in known:
+                    print(warn(f"unknown repo '{n}'"))
+        return out
+
+    def ordered_for_clone(self, repos: List[Repo]) -> List[Repo]:
+        rank = {"root": 0, "submodule": 1, "nested": 2}
+        return sorted(repos, key=lambda r: (rank.get(r.kind, 9), r.rel_path))
+
+    def lock_path(self) -> Path:
+        return self.profile_dir / "lock.json" if self.profile_dir else LOCKS_DIR / "upstream.lock.json"
+
+    def resolve_path(self, rel: str) -> Path:
+        """A path named in a profile is relative to the enterprise repo first, then to this tool."""
+        for base in ([self.profile_dir] if self.profile_dir else []) + [TOOL_ROOT]:
+            if (base / rel).exists():
+                return (base / rel).resolve()
+        looked = ", ".join(str(b / rel) for b in ([self.profile_dir] if self.profile_dir else []) + [TOOL_ROOT])
+        sys.exit(err(f"'{rel}' not found (looked at: {looked})"))
+
+
+# ----------------------------------------------------------------------------
+# remotes
+# ----------------------------------------------------------------------------
+def remote_url(repo_dir: Path, remote: str) -> Optional[str]:
+    cp = git(repo_dir, "remote", "get-url", remote, check=False)
+    return cp.stdout.strip() if cp.returncode == 0 else None
+
+
+def set_remote(repo_dir: Path, remote: str, url: str) -> str:
+    cur = remote_url(repo_dir, remote)
+    if cur is None:
+        git(repo_dir, "remote", "add", remote, url)
+        return "added"
+    if cur != url:
+        git(repo_dir, "remote", "set-url", remote, url)
+        return f"updated (was {cur})"
+    return "ok"
+
+
+def ensure_remotes(ws: Workspace, repo: Repo, https: bool, quiet: bool = False) -> List[str]:
+    msgs = []
+    if not repo.exists:
+        return [warn("not cloned")]
+    for key, org in ws.orgs.items():
+        name = repo.repo_name_in(key)
+        if name is None:
+            if remote_url(repo.path, org.remote) is not None:
+                git(repo.path, "remote", "remove", org.remote)
+                msgs.append(f"{org.remote}: removed (repo not in {org.github_org})")
+            continue
+        msgs.append(f"{org.remote}: {set_remote(repo.path, org.remote, org.url(name, https))}")
+    origin_key = repo.first_org(ws.primary_key)
+    if origin_key:
+        o = ws.orgs[origin_key]
+        msgs.append(f"origin -> {o.remote}: {set_remote(repo.path, 'origin', o.url(repo.repo_name_in(origin_key), https))}")
+    if (repo.path / ".gitmodules").exists():
+        git(repo.path, "submodule", "sync", "--quiet", "--recursive", check=False)
+        msgs.append("submodule sync")
+    if not quiet:
+        print(f"  {bold(repo.name)}: " + ", ".join(msgs))
+    return msgs
+
+
+def fetch_one(repo: Repo, remotes: List[str], prune: bool) -> Tuple[Repo, Dict[str, str]]:
+    res = {}
+    for rem in remotes:
+        if remote_url(repo.path, rem) is None:
+            continue
+        args = ["fetch", "--quiet", rem] + (["--prune"] if prune else [])
+        cp = git(repo.path, *args, check=False)
+        if cp.returncode == 0:
+            res[rem] = "ok"
+        elif "Repository not found" in cp.stderr or "not found" in cp.stderr.lower():
+            res[rem] = "not provisioned"
+        elif "Permission denied" in cp.stderr or "Could not read" in cp.stderr:
+            res[rem] = "no access"
+        else:
+            res[rem] = f"failed: {last_line(cp.stderr)}"
+    return repo, res
+
+
+def ahead_behind(repo_dir: Path, a_ref: str, b_ref: str) -> Optional[Tuple[int, int]]:
+    cp = git(repo_dir, "rev-list", "--left-right", "--count", f"{a_ref}...{b_ref}", check=False)
+    if cp.returncode != 0:
+        return None
+    left, right = cp.stdout.split()
+    return int(left), int(right)
+
+
+def ref_exists(repo_dir: Path, ref: str) -> bool:
+    return git_ok(repo_dir, "rev-parse", "--verify", "--quiet", ref)
+
+
+# ----------------------------------------------------------------------------
+# pull requests: open, then let GitHub finish (auto-merge; branch deleted on merge)
+# ----------------------------------------------------------------------------
+def gh_full(org: Org, repo: Repo) -> str:
+    return f"{org.github_org}/{repo.repo_name_in(org.key)}"
+
+
+def gh_pr_create(org: Org, repo: Repo, head: str, title: str, body: str) -> Tuple[bool, str, str]:
+    """Returns (ok, url, note). An open PR that already exists for `head` counts as ok."""
+    full = gh_full(org, repo)
+    cp = run(["gh", "pr", "create", "--repo", full, "--base", repo.branch_in(org.key), "--head", head,
+              "--title", title, "--body", body], check=False)
+    if cp.returncode == 0:
+        return True, cp.stdout.strip(), ""
+    if "already exists" in cp.stderr:
+        cp2 = run(["gh", "pr", "view", head, "--repo", full, "--json", "url", "-q", ".url"], check=False)
+        return True, cp2.stdout.strip() or head, "existing"
+    return False, "", last_line(cp.stderr)
+
+
+def arm_auto_merge(org: Org, repo: Repo, pr: str, method: str) -> str:
+    """Ask GitHub to merge `pr` with `method` as soon as every requirement (reviews, checks) is met.
+    If the PR already meets them, gh merges it right away. The head branch is removed by the repo's
+    delete_branch_on_merge setting (policy / provisioning); `cleanup` is the backstop."""
+    full = gh_full(org, repo)
+    cp = run(["gh", "pr", "merge", pr, "--repo", full, "--auto", f"--{method}"], check=False)
+    if cp.returncode == 0:
+        return ok(f"auto-merge armed ({method}); branch deleted on merge")
+    msg = last_line(cp.stderr) or last_line(cp.stdout)
+    low = msg.lower()
+    hint = ""
+    if "clean status" in low:
+        hint = (f" -> the PR already meets every requirement, which means its base branch is NOT protected; "
+                f"check the repo's default branch / protection, then merge by hand: gh pr merge {pr} --{method}")
+    elif "auto-merge" in low or "auto merge" in low or "not enabled" in low or "protected" in low:
+        hint = f" -> enable allow_auto_merge + branch protection (harden / provisioning), then: gh pr merge {pr} --auto --{method}"
+    elif f"{method}" in low and ("not allowed" in low or "disabled" in low or "not enabled" in low):
+        hint = f" -> the repository does not allow {method} merges; fix the repo settings or merge by hand"
+    return warn(f"auto-merge not armed: {msg}{hint}")
+
+
+def pr_body_footer(method: str) -> str:
+    what = "a **merge commit** (never squash or rebase: the two histories must keep a common ancestor)" \
+        if method == "merge" else f"**{method}**"
+    return (f"\n\n---\nMerge method: {what}. `reactory-repos` arms GitHub auto-merge with that method; the PR "
+            "lands as soon as the required review and checks pass, and the head branch is deleted on merge.\n")
+
+
+# ----------------------------------------------------------------------------
+# commands
+# ----------------------------------------------------------------------------
+def cmd_list(ws: Workspace, a) -> int:
+    repos = ws.select(a.repo, a.group)
+    print(f"workspace root: {ws.root}   profile: {ws.profile_name or '(none)'}   primary org: {ws.primary.github_org}\n")
+    cols = [(o.key, 14) for o in ws.orgs.values()]
+    print(bold(pad("repo", 38) + pad("kind", 10) + "".join(pad(k, w) for k, w in cols) + pad("local", 10) + "path"))
+    for r in repos:
+        marks = ""
+        for key, w in cols:
+            n = r.repo_name_in(key)
+            marks += pad(dim("-") if n is None else ("yes" if n == r.name else n), w)
+        local = ok("git") if r.exists else (warn("plain dir") if r.is_plain_dir else dim("missing"))
+        print(pad(r.name, 38) + pad(r.kind, 10) + marks + pad(local, 10) + r.rel_path)
+        if a.verbose and r.note:
+            print(dim(f"    note: {r.note}"))
+    return 0
+
+
+def cmd_clone(ws: Workspace, a) -> int:
+    repos = ws.ordered_for_clone(ws.select(a.repo, a.group))
+    lock = read_lock(ws) if a.locked else {}
+    rc = 0
+    for r in repos:
+        if r.exists:
+            print(f"{dim('exists ')} {r.name}")
+            ensure_remotes(ws, r, a.https)
+            continue
+        if r.is_plain_dir and any(r.path.iterdir()):
+            print(f"{warn('skip   ')} {r.name}: {r.rel_path} exists but is not a git repository" + (f" ({r.note})" if r.note else ""))
+            continue
+        src_key = r.first_org(ws.primary_key)
+        if src_key is None:
+            print(f"{warn('skip   ')} {r.name}: no GitHub repository in any org yet" + (f" ({r.note})" if r.note else ""))
+            continue
+        src = ws.orgs[src_key]
+        if r.kind == "submodule":
+            parent = next((p for p in ws.repos if p.name == r.parent), None)
+            if parent and parent.exists:
+                print(f"{ok('submod ')} {r.name}: git submodule update --init in {parent.rel_path}")
+                cp = git(parent.path, "submodule", "update", "--init", "--", os.path.relpath(r.path, parent.path), check=False)
+                if cp.returncode != 0:
+                    print(err(cp.stderr.strip())); rc = 1; continue
+                ensure_remotes(ws, r, a.https)
+                continue
+        url = src.url(r.repo_name_in(src_key), a.https)
+        branch = r.branch_in(src_key)
+        print(f"{ok('clone  ')} {r.name} <- {url} ({branch}) -> {r.rel_path}")
+        r.path.parent.mkdir(parents=True, exist_ok=True)
+        args = ["git", "clone", "--branch", branch] + (["--recurse-submodules"] if r.kind == "root" else [])
+        if a.depth and not a.locked:
+            args += ["--depth", str(a.depth)]
+        cp = run(args + [url, str(r.path)], check=False)
+        if cp.returncode != 0:
+            print(err(cp.stderr.strip())); rc = 1; continue
+        ensure_remotes(ws, r, a.https)
+        if a.locked and r.name in lock:
+            sha = lock[r.name]["sha"]
+            if not git_ok(r.path, "checkout", "-q", "--detach", sha):
+                print(warn(f"         lock sha {sha[:10]} not reachable in {r.name}")); rc = 1
+            else:
+                print(dim(f"         pinned at {sha[:10]} (lock)"))
+    return rc
+
+
+def cmd_remotes(ws: Workspace, a) -> int:
+    print(f"ensuring remotes (origin -> {ws.primary.github_org})")
+    for r in ws.select(a.repo, a.group, include_missing=False):
+        ensure_remotes(ws, r, a.https)
+    return 0
+
+
+def cmd_fetch(ws: Workspace, a) -> int:
+    repos = ws.select(a.repo, a.group, include_missing=False)
+    remotes = [o.remote for o in ws.orgs.values()]
+    rc = 0
+    with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
+        for repo, res in ex.map(lambda r: fetch_one(r, remotes, not a.no_prune), repos):
+            parts = [f"{rem}={ok(st) if st == 'ok' else warn(st)}" for rem, st in res.items()]
+            rc = 1 if any(st.startswith("failed") for st in res.values()) else rc
+            print(f"  {pad(repo.name, 38)} " + "  ".join(parts))
+    return rc
+
+
+def cmd_status(ws: Workspace, a) -> int:
+    repos = ws.select(a.repo, a.group, include_missing=False)
+    if a.fetch:
+        cmd_fetch(ws, argparse.Namespace(repo=a.repo, group=a.group, jobs=8, no_prune=False)); print()
+    up = ws.upstream
+    mcols = [(ws.orgs[k], 48) for k in ws.mirror_keys]
+    print(bold(pad("repo", 38) + pad("branch", 32) + pad("tree", 6) +
+               "".join(pad(f"{up.key}<>{o.key}", w) for o, w in mcols) + "local vs origin"))
+    for r in repos:
+        branch = git_out(r.path, "branch", "--show-current") or dim("(detached)")
+        tree = warn("dirty") if git_out(r.path, "status", "--porcelain", "--untracked-files=no") else ok("clean")
+        cmp_cols = ""
+        for m, w in mcols:
+            up_ref, m_ref = f"{up.remote}/{r.branch_in(up.key)}", f"{m.remote}/{r.branch_in(m.key)}"
+            if not r.in_org(up.key):
+                cmp = dim(f"{m.key} only") if r.in_org(m.key) else dim("-")
+            elif not r.in_org(m.key):
+                cmp = dim(f"{up.key} only")
+            elif not ref_exists(r.path, m_ref):
+                cmp = warn(f"{m.key}: no ref (not provisioned / not fetched)")
+            elif not ref_exists(r.path, up_ref):
+                cmp = warn(f"{up.key}: no ref")
+            else:
+                ab = ahead_behind(r.path, up_ref, m_ref)
+                cmp = warn("?") if ab is None else (ok("in sync") if ab == (0, 0) else f"{up.key} +{ab[0]} / {m.key} +{ab[1]}")
+            cmp_cols += pad(cmp, w)
+        if git_ok(r.path, "rev-parse", "--abbrev-ref", "@{upstream}"):
+            upstream = git_out(r.path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+            ab2 = ahead_behind(r.path, "HEAD", upstream) or (0, 0)
+            loc = f"{upstream}: " + (ok("up to date") if ab2 == (0, 0) else f"ahead {ab2[0]} / behind {ab2[1]}")
+        else:
+            loc = dim("no upstream")
+        print(pad(r.name, 38) + pad(branch, 32) + pad(tree, 6) + cmp_cols + loc)
+    return 0
+
+
+def cmd_exec(ws: Workspace, a) -> int:
+    rc = 0
+    for r in ws.select(a.repo, a.group, include_missing=False):
+        print(bold(f"\n== {r.name} ({r.rel_path})"))
+        cp = subprocess.run(a.command, cwd=str(r.path), text=True)
+        rc = cp.returncode or rc
+    return rc
+
+
+def cmd_push(ws: Workspace, a) -> int:
+    target = ws.org(a.to)
+    rc = 0
+    for r in ws.select(a.repo, a.group, include_missing=False):
+        if not r.in_org(target.key):
+            print(f"{dim('skip   ')} {r.name}: no repository in {target.github_org}"); continue
+        branch = a.branch or git_out(r.path, "branch", "--show-current")
+        if not branch:
+            print(f"{warn('skip   ')} {r.name}: detached HEAD, pass --branch"); continue
+        if target.protected and branch == r.branch_in(target.key) and not a.force_protected:
+            print(f"{warn('skip   ')} {r.name}: '{branch}' is the protected default branch in {target.github_org}; "
+                  f"push a feature branch and open a PR (or `sync --to {target.key} --pr`)"); continue
+        args = (["push", "-u"] if a.set_upstream else ["push"]) + [target.remote, f"{branch}:{branch}"]
+        print(f"{ok('push   ')} {r.name}: {branch} -> {target.remote}")
+        cp = git(r.path, *args, check=False)
+        if cp.returncode != 0:
+            print(err(cp.stderr.strip())); rc = 1; continue
+        if a.pr:
+            if branch == r.branch_in(target.key):
+                print(warn("         --pr ignored: the branch is the default branch")); continue
+            title = a.title or git_out(r.path, "log", "-1", "--format=%s", branch)
+            body = (a.body or f"Opened by `reactory-repos push --to {target.key} --pr` from `{branch}`.") \
+                + pr_body_footer(target.pr_merge_method)
+            good, url, note = gh_pr_create(target, r, branch, title, body)
+            if not good:
+                print(err(f"         gh pr create failed: {note}")); rc = 1; continue
+            print(f"         {ok('PR: ' + url)}{dim(' (' + note + ')') if note else ''}")
+            if target.auto_merge and not a.no_auto_merge:
+                print("         " + arm_auto_merge(target, r, url, target.pr_merge_method))
+    return rc
+
+
+# ----------------------------------------------------------------------------
+# sync
+# ----------------------------------------------------------------------------
+def apply_org_specific_paths(wt: Path, target_ref: str, keep: List[str], drop: List[str]) -> List[str]:
+    """`keep`: the target org owns these paths, its version wins (absent in target => removed).
+    `drop`: the source org owns these paths; they never enter the target."""
+    actions = []
+
+    def remove(p: str, why: str):
+        git(wt, "rm", "-q", "-r", "--force", "--ignore-unmatch", "--", p, check=False)
+        if (wt / p).exists():
+            shutil.rmtree(wt / p) if (wt / p).is_dir() else (wt / p).unlink()
+        actions.append(f"drop {p} ({why})")
+
+    for p in keep:
+        in_target = git_ok(wt, "cat-file", "-e", f"{target_ref}:{p}")
+        tracked_or_present = (wt / p).exists() or git_ok(wt, "ls-files", "--error-unmatch", p)
+        if in_target:
+            git(wt, "checkout", target_ref, "--", p)
+            actions.append(f"keep {p} from target")
+        elif tracked_or_present:
+            remove(p, "not in target")
+    for p in drop:
+        if p in keep:
+            continue
+        if (wt / p).exists() or git_ok(wt, "ls-files", "--error-unmatch", p):
+            in_target = git_ok(wt, "cat-file", "-e", f"{target_ref}:{p}")
+            if in_target:
+                git(wt, "checkout", target_ref, "--", p)
+                actions.append(f"keep {p} from target (source-owned)")
+            else:
+                remove(p, "owned by source org")
+    return actions
+
+
+def org_paths_for(src: Org, tgt: Org) -> Tuple[List[str], List[str]]:
+    """Paths each org owns: the target's are kept from the target, the source's never cross."""
+    return list(tgt.org_specific_paths), list(src.org_specific_paths)
+
+
+def sync_repo(ws: Workspace, r: Repo, src: Org, tgt: Org, do_push: bool, do_pr: bool,
+              keep_worktree: bool, dry_run: bool, auto_merge: bool = True) -> str:
+    if not (r.in_org(src.key) and r.in_org(tgt.key)):
+        return dim("skip: not present in both orgs")
+    if git_out(r.path, "status", "--porcelain", "--untracked-files=no"):
+        return warn("skip: working tree is dirty")
+    _, fres = fetch_one(r, [src.remote, tgt.remote], prune=False)
+    for rem, st in fres.items():
+        if st != "ok":
+            return warn(f"skip: {rem} {st}")
+    src_ref, tgt_ref = f"{src.remote}/{r.branch_in(src.key)}", f"{tgt.remote}/{r.branch_in(tgt.key)}"
+    if not ref_exists(r.path, src_ref):
+        return warn(f"skip: {src_ref} does not exist")
+    if not ref_exists(r.path, tgt_ref):
+        return warn(f"skip: {tgt_ref} does not exist. Use `bootstrap --to {tgt.key}` for the first import.")
+    if git_ok(r.path, "merge-base", "--is-ancestor", src_ref, tgt_ref):
+        return ok("up to date")
+    ab = ahead_behind(r.path, src_ref, tgt_ref) or (0, 0)
+    if dry_run:
+        return f"would merge {src_ref} (+{ab[0]}) into {tgt_ref} (+{ab[1]})"
+
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M")
+    sync_branch = f"sync/{src.key}-to-{tgt.key}-{stamp}"
+    wt_dir = Path(tempfile.mkdtemp(prefix=f"reactory-sync-{r.name}-"))
+    git(r.path, "worktree", "add", "--detach", str(wt_dir), tgt_ref)
+    try:
+        git(wt_dir, "checkout", "-q", "-b", sync_branch)
+        msg = f"Sync {src.github_org}/{r.repo_name_in(src.key)}@{r.branch_in(src.key)} into {tgt.github_org}@{r.branch_in(tgt.key)}"
+        git(wt_dir, "merge", "--no-ff", "--no-commit", "--no-edit", src_ref, check=False)
+        actions = apply_org_specific_paths(wt_dir, tgt_ref, *org_paths_for(src, tgt))
+        conflicts = git_out(wt_dir, "diff", "--name-only", "--diff-filter=U").splitlines()
+        if conflicts:
+            if keep_worktree:
+                return err(f"conflicts in {len(conflicts)} file(s); resolve in {wt_dir}, then `git commit` and "
+                           f"`git push {tgt.remote} {sync_branch}`: " + ", ".join(conflicts[:5]))
+            git(wt_dir, "merge", "--abort", check=False)
+            return err(f"conflicts in: {', '.join(conflicts[:8])}{' ...' if len(conflicts) > 8 else ''}. "
+                       f"Re-run with --keep-worktree to resolve by hand.")
+        git(wt_dir, "commit", "-q", "--no-verify", "-m", msg + ("\n\n" + "\n".join(actions) if actions else ""))
+        sha = git_out(wt_dir, "rev-parse", "--short", "HEAD")
+        result = f"merged {src_ref} (+{ab[0]}) -> {sync_branch} @ {sha}" + (f" [{len(actions)} org path(s)]" if actions else "")
+        if not (do_push or do_pr):
+            return result + " (local only; use --push / --pr)"
+        if tgt.protected or do_pr:
+            cp = git(wt_dir, "push", "-q", tgt.remote, f"{sync_branch}:{sync_branch}", check=False)
+            if cp.returncode != 0:
+                return err(f"{result}; push failed: {cp.stderr.strip()}")
+            result += f"; pushed {sync_branch} to {tgt.remote}"
+            if do_pr:
+                title = f"{tgt.pr_title_prefix + ': ' if tgt.pr_title_prefix else ''}{msg}"
+                body = (f"Automated sync produced by `reactory-repos sync`.\n\n"
+                        f"Source: `{src.github_org}/{r.repo_name_in(src.key)}` branch `{r.branch_in(src.key)}`\n"
+                        f"Target: `{tgt.github_org}/{r.repo_name_in(tgt.key)}` branch `{r.branch_in(tgt.key)}`\n\n"
+                        f"**Merge with a merge commit (not squash / rebase)** so the two histories keep a common ancestor.\n")
+                if actions:
+                    body += "\nOrg-specific paths handled:\n" + "\n".join(f"- {x}" for x in actions)
+                body += pr_body_footer(tgt.sync_merge_method)
+                good, url, note = gh_pr_create(tgt, r, sync_branch, title, body)
+                result += "; " + (ok("PR: " + url) + (f" ({note})" if note else "") if good else err("gh pr create failed: " + note))
+                if good and auto_merge:
+                    result += "; " + arm_auto_merge(tgt, r, url, tgt.sync_merge_method)
+        else:
+            cp = git(wt_dir, "push", "-q", tgt.remote, f"{sync_branch}:{r.branch_in(tgt.key)}", check=False)
+            if cp.returncode != 0:
+                return err(f"{result}; push failed: {cp.stderr.strip()}")
+            result += f"; pushed to {tgt_ref}"
+        return result
+    finally:
+        if not keep_worktree:
+            git(r.path, "worktree", "remove", "--force", str(wt_dir), check=False)
+            shutil.rmtree(wt_dir, ignore_errors=True)
+            git(r.path, "worktree", "prune", check=False)
+
+
+def cmd_sync(ws: Workspace, a) -> int:
+    repos = ws.select(a.repo, a.group, include_missing=False)
+    targets = list(ws.orgs) if a.to == "all" else [a.to]
+    rc = 0
+    for tgt_key in targets:
+        tgt = ws.org(tgt_key)
+        src = ws.source_for(tgt, a.from_org)
+        if src.key == tgt.key:
+            continue
+        print(bold(f"\nsync {src.github_org} -> {tgt.github_org}"))
+        for r in repos:
+            res = sync_repo(ws, r, src, tgt, a.push, a.pr, a.keep_worktree, a.dry_run,
+                            auto_merge=tgt.auto_merge and not a.no_auto_merge)
+            print(f"  {pad(r.name, 38)} {res}")
+            if "conflict" in res or "failed" in res:
+                rc = 1
+    return rc
+
+
+def cmd_bootstrap(ws: Workspace, a) -> int:
+    """First push of a repo's history into an org where the repo was just created."""
+    tgt = ws.org(a.to)
+    rc = 0
+    for r in ws.select(a.repo, a.group, include_missing=False):
+        if not r.in_org(tgt.key):
+            print(f"{dim('skip   ')} {r.name}: not defined for {tgt.github_org}"); continue
+        ensure_remotes(ws, r, a.https, quiet=True)
+        _, fres = fetch_one(r, [tgt.remote], prune=False)
+        if fres.get(tgt.remote) != "ok":
+            print(f"{warn('skip   ')} {r.name}: {tgt.remote} {fres.get(tgt.remote, '?')}"); rc = 1; continue
+        cand = ws.source_for(tgt, a.from_org)
+        src: Optional[Org] = cand if r.in_org(cand.key) else None
+        if src is not None:
+            fetch_one(r, [src.remote], prune=False)
+            src_ref = f"{src.remote}/{r.branch_in(src.key)}"
+            if not ref_exists(r.path, src_ref):
+                print(f"{warn('skip   ')} {r.name}: {src_ref} not found"); continue
+            import_branch = a.branch or f"import/{src.key}-{r.branch_in(src.key)}"
+        else:
+            src_ref = "HEAD"
+            import_branch = a.branch or f"import/local-{git_out(r.path, 'branch', '--show-current') or 'head'}"
+        print(f"{ok('import ')} {r.name}: {src_ref} -> {tgt.remote}/{import_branch}")
+        if a.dry_run:
+            continue
+        cp = git(r.path, "push", tgt.remote, f"{src_ref}:refs/heads/{import_branch}", check=False)
+        if cp.returncode != 0:
+            print(err(cp.stderr.strip())); rc = 1; continue
+        tgt_default = f"{tgt.remote}/{r.branch_in(tgt.key)}"
+        git(r.path, "fetch", "--quiet", tgt.remote, check=False)
+        if ref_exists(r.path, tgt_default):
+            n = git_out(r.path, "rev-list", "--count", tgt_default)
+            print(dim(f"         {tgt_default} already exists ({n} commit(s), auto-initialised). Open a PR "
+                      f"{import_branch} -> {r.branch_in(tgt.key)} and merge it with a MERGE COMMIT."))
+            if a.pr:
+                title = f"{tgt.pr_title_prefix + ': ' if tgt.pr_title_prefix else ''}Import {src.github_org + '/' if src else ''}{r.name} history"
+                body = "Initial import of the upstream history. Merge with a merge commit, never squash." + pr_body_footer(tgt.sync_merge_method)
+                good, url, note = gh_pr_create(tgt, r, import_branch, title, body)
+                print("         " + (ok("PR: " + url) + (f" ({note})" if note else "") if good else err("gh pr create failed: " + note)))
+                if good and tgt.auto_merge and not a.no_auto_merge:
+                    print("         " + arm_auto_merge(tgt, r, url, tgt.sync_merge_method))
+        else:
+            print(dim(f"         {tgt_default} does not exist yet; also pushing as {r.branch_in(tgt.key)}"))
+            git(r.path, "push", tgt.remote, f"{src_ref}:refs/heads/{r.branch_in(tgt.key)}", check=False)
+    return rc
+
+
+def cmd_init(ws: Workspace, a) -> int:
+    for r in ws.select(a.repo, a.group):
+        if r.exists:
+            print(f"{dim('exists ')} {r.name}"); continue
+        if not r.path.exists():
+            print(f"{warn('skip   ')} {r.name}: {r.rel_path} not found"); continue
+        org_key = r.first_org(ws.primary_key) or r.native_org or ws.primary_key
+        branch = r.branch_in(org_key)
+        print(f"{ok('init   ')} {r.name}: git init -b {branch} in {r.rel_path}")
+        if a.dry_run:
+            continue
+        git(r.path, "init", "-q", "-b", branch)
+        tmpl = TOOL_ROOT / "templates" / ".gitignore-module"
+        if tmpl.exists() and not (r.path / ".gitignore").exists():
+            shutil.copy(tmpl, r.path / ".gitignore")
+        git(r.path, "add", "-A")
+        git(r.path, "commit", "-q", "-m", f"Initial commit: {r.description or r.name}", check=False)
+        ensure_remotes(ws, r, a.https)
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# locks: pin every repo to a commit so a build is reproducible and reviewable
+# ----------------------------------------------------------------------------
+def read_lock(ws: Workspace) -> Dict[str, dict]:
+    p = ws.lock_path()
+    if not p.exists():
+        sys.exit(err(f"no lock file at {p}; run `lock` first"))
+    return json.loads(p.read_text()).get("repos", {})
+
+
+def cmd_lock(ws: Workspace, a) -> int:
+    entries = {}
+    for r in ws.select(a.repo, a.group, include_missing=False):
+        sha = git_out(r.path, "rev-parse", "HEAD")
+        branch = git_out(r.path, "branch", "--show-current")
+        dirty = bool(git_out(r.path, "status", "--porcelain", "--untracked-files=no"))
+        entries[r.name] = {"path": r.rel_path, "sha": sha, "branch": branch, "origin": remote_url(r.path, "origin") or "", "dirty": dirty}
+        print(f"  {pad(r.name, 38)} {sha[:12]} {branch}{warn(' dirty') if dirty else ''}")
+    out = {"profile": ws.profile_name, "primary_org": ws.primary.github_org,
+           "generated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "repos": entries}
+    ws.lock_path().parent.mkdir(parents=True, exist_ok=True)
+    ws.lock_path().write_text(json.dumps(out, indent=2) + "\n")
+    print(ok(f"\nwrote {ws.lock_path()} ({len(entries)} repos)"))
+    if any(e["dirty"] for e in entries.values()):
+        print(warn("some repos have uncommitted changes; the lock records HEAD, not the working tree"))
+    return 0
+
+
+def cmd_checkout_lock(ws: Workspace, a) -> int:
+    lock = read_lock(ws)
+    rc = 0
+    for r in ws.select(a.repo, a.group, include_missing=False):
+        e = lock.get(r.name)
+        if not e:
+            print(f"{dim('skip   ')} {r.name}: not in lock"); continue
+        if git_out(r.path, "rev-parse", "HEAD") == e["sha"]:
+            print(f"{ok('ok     ')} {r.name} already at {e['sha'][:12]}"); continue
+        if git_out(r.path, "status", "--porcelain", "--untracked-files=no") and not a.force:
+            print(f"{warn('skip   ')} {r.name}: dirty working tree (use --force to discard)"); rc = 1; continue
+        if not git_ok(r.path, "cat-file", "-e", e["sha"]):
+            for rem in [o.remote for o in ws.orgs.values()]:
+                git(r.path, "fetch", "--quiet", rem, check=False)
+        cp = git(r.path, "checkout", "-q", "--detach", e["sha"], check=False)
+        print(f"{ok('pinned ') if cp.returncode == 0 else err('failed ')} {r.name} -> {e['sha'][:12]}" +
+              ("" if cp.returncode == 0 else f": {last_line(cp.stderr)}"))
+        rc = rc or cp.returncode
+    return rc
+
+
+# ----------------------------------------------------------------------------
+# check
+# ----------------------------------------------------------------------------
+def cmd_check(ws: Workspace, a) -> int:
+    problems = 0
+    print(bold("tooling"))
+    for tool in ("git", "gh"):
+        print(f"  {tool}: {ok('found') if shutil.which(tool) else err('missing')}")
+    cp = run(["gh", "auth", "status"], check=False)
+    print(f"  gh auth: {ok('ok') if cp.returncode == 0 else warn('not logged in')}")
+    for org in ws.orgs.values():
+        cp = run(["gh", "api", f"user/memberships/orgs/{org.github_org}", "--jq", ".role+\" \"+.state"], check=False)
+        print(f"  {org.github_org} ({org.role}): {ok(cp.stdout.strip()) if cp.returncode == 0 else warn('no membership visible')}")
+    print(bold("\ncommit signing"))
+    needs_sig = [o for o in ws.orgs.values() if o.policy_path and
+                 (strip_comments(load_jsonc((TOOL_ROOT / o.policy_path).resolve())).get("repo", {}).get("branch_protection", {}) or {}).get("required_signatures")]
+    gpgsign = run(["git", "config", "--get", "commit.gpgsign"], check=False).stdout.strip() == "true"
+    key = run(["git", "config", "--get", "user.signingkey"], check=False).stdout.strip()
+    if needs_sig:
+        good = gpgsign and bool(key)
+        print(f"  {', '.join(o.github_org for o in needs_sig)} require signed commits: "
+              + (ok(f"commit.gpgsign=true, key {key}") if good else err("configure commit.gpgsign=true and user.signingkey, or sync/seed pushes will be rejected")))
+        problems += 0 if good else 1
+    else:
+        print(f"  no org requires signatures ({'signing on' if gpgsign else 'signing off'})")
+    print(bold("\n.gitmodules URLs (relative = follow origin's org)"))
+    for r in ws.repos:
+        gm = r.path / ".gitmodules"
+        if not (r.exists and gm.exists()):
+            continue
+        for line in gm.read_text().splitlines():
+            m = re.match(r"\s*url\s*=\s*(.+)", line)
+            if m:
+                url = m.group(1).strip()
+                good = url.startswith("../") or url.startswith("./")
+                print(f"  {r.name}: {url} {ok('relative') if good else warn('absolute (pinned to one org)')}")
+                problems += 0 if good else 1
+    print(bold("\nremotes"))
+    for r in ws.repos:
+        if not r.exists:
+            continue
+        missing = [o.remote for k, o in ws.orgs.items() if r.in_org(k) and remote_url(r.path, o.remote) is None]
+        origin = remote_url(r.path, "origin")
+        ok_key = r.first_org(ws.primary_key)
+        state = []
+        if missing:
+            state.append(warn("missing " + ",".join(missing))); problems += 1
+        if ok_key and origin and origin not in (ws.orgs[ok_key].url(r.repo_name_in(ok_key)), ws.orgs[ok_key].url(r.repo_name_in(ok_key), True)):
+            state.append(warn(f"origin={origin}")); problems += 1
+        print(f"  {pad(r.name, 38)} {ok('ok') if not state else ' '.join(state)}")
+    print(bold("\nunversioned folders"))
+    for r in ws.repos:
+        if r.is_plain_dir:
+            print(f"  {warn(r.name)}: {r.rel_path} has no .git ({r.note})")
+    print(bold("\nenterprises (enterprises/<name>/, gitignored)"))
+    if not ws.enterprises:
+        print(f"  {dim('none; `enterprise add <git-url>` or `enterprise init <name>`')}")
+    for name, d in ws.enterprises.items():
+        active = " (active)" if name == ws.profile_name else ""
+        print(f"  {pad(name, 38)} {d}{active} {ok('git') if (d / '.git').exists() else warn('not a git repo')}")
+    lp = ws.lock_path()
+    print(bold("\nlock") + f"\n  {lp}: " + (ok("present") if lp.exists() else dim("none (run `lock`)")))
+    print()
+    print(ok("no problems found") if problems == 0 else warn(f"{problems} problem(s); run `remotes`"))
+    return 0 if problems == 0 else 1
+
+
+# ----------------------------------------------------------------------------
+# enterprises: configuration repos nested under enterprises/<name>/ (gitignored)
+# ----------------------------------------------------------------------------
+def cmd_enterprise(ws: Workspace, a) -> int:
+    if a.action == "list":
+        if not ws.enterprises:
+            print(dim("no enterprises under enterprises/; `enterprise add <git-url>` or `enterprise init <name>`"))
+            return 0
+        print(f"{pad('enterprise', 20)} {pad('display name', 22)} {pad('branch', 14)} {pad('origin', 60)} state")
+        for name, d in ws.enterprises.items():
+            prof = load_jsonc(d / "profile.json")
+            is_git = (d / ".git").exists()
+            branch = git_out(d, "branch", "--show-current") if is_git else "-"
+            origin = (remote_url(d, "origin") or dim("no remote")) if is_git else warn("not a git repo")
+            dirty = is_git and bool(git_out(d, "status", "--porcelain"))
+            state = (warn("dirty") if dirty else ok("clean")) if is_git else ""
+            active = bold(" (active)") if name == ws.profile_name else ""
+            print(f"{pad(name, 20)} {pad(prof.get('display_name', ''), 22)} {pad(branch, 14)} {pad(origin, 60)} {state}{active}")
+        return 0
+    if a.action == "add":
+        if not a.arg:
+            sys.exit(err("enterprise add <git-url> [--name <name>]"))
+        name = a.name or re.sub(r"^reactory-workspace-", "", Path(a.arg.rstrip("/")).name.removesuffix(".git"))
+        dest = ENTERPRISES_DIR / name
+        if dest.exists():
+            sys.exit(err(f"{dest} already exists"))
+        ENTERPRISES_DIR.mkdir(exist_ok=True)
+        print(f"cloning {a.arg} -> {dest}")
+        cp = run(["git", "clone", "-q", a.arg, str(dest)], check=False)
+        if cp.returncode != 0:
+            sys.exit(err(last_line(cp.stderr)))
+        if not (dest / "profile.json").exists():
+            print(warn(f"{dest} has no profile.json; it will not be discovered until it has one"))
+        else:
+            print(ok(f"enterprise '{name}' ready: bin/reactory-repos --profile {name} list  (or export REACTORY_PROFILE={name})"))
+        return 0
+    if a.action == "init":
+        name = a.arg or a.name
+        if not name or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+            sys.exit(err("enterprise init <name>   (lowercase letters, digits, dashes)"))
+        dest = ENTERPRISES_DIR / name
+        if dest.exists():
+            sys.exit(err(f"{dest} already exists"))
+        if not ENTERPRISE_TEMPLATE_DIR.is_dir():
+            sys.exit(err(f"template folder missing: {ENTERPRISE_TEMPLATE_DIR}"))
+        title = name.replace("-", " ").title()
+        for src in ENTERPRISE_TEMPLATE_DIR.rglob("*"):
+            if src.is_dir():
+                continue
+            rel = src.relative_to(ENTERPRISE_TEMPLATE_DIR)
+            out = dest / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            text = src.read_text().replace("example-enterprise", name).replace("Example Enterprise", title)
+            out.write_text(text)
+        git(dest, "init", "-q", "-b", "main")
+        git(dest, "add", "-A")
+        git(dest, "commit", "-q", "-m", f"Initial commit: {title} enterprise configuration for reactory-workspace", check=False)
+        print(ok(f"created {dest} (git repo, branch main). Edit profile.json, then: bin/reactory-repos --profile {name} list"))
+        print(dim("push it to the enterprise's own organisation; it must never be committed into reactory-workspace"))
+        return 0
+    sys.exit(err(f"unknown action {a.action}"))
+
+
+# ----------------------------------------------------------------------------
+# provisioning: render repo definitions for the target org's repo-management system
+# ----------------------------------------------------------------------------
+LETTER_RANGES = {ch: f"{a}-{b}" for a, b in zip("acegikmoqsuwy", "bdfhjlnprtvxz") for ch in (a, b)}
+IF_BLOCK = re.compile(r"\{\{#if (\w+)\}\}(.*?)\{\{/if\}\}", re.S)
+VAR = re.compile(r"\{\{(\w+)\}\}")
+
+
+def render(template: str, ctx: dict) -> str:
+    text = IF_BLOCK.sub(lambda m: m.group(2) if ctx.get(m.group(1)) else "", template)
+
+    def var_sub(m):
+        v = ctx.get(m.group(1), "")
+        return "\n".join(f"      - {x}" for x in v) if isinstance(v, list) else str(v)
+    return VAR.sub(var_sub, text)
+
+
+def cmd_provision(ws: Workspace, a) -> int:
+    tgt = ws.org(a.to)
+    if not tgt.provisioning:
+        sys.exit(err(f"org '{tgt.key}' has no `provisioning` block in profile {ws.profile_name}"))
+    prov = tgt.provisioning
+    template = ws.resolve_path(prov["template"]).read_text()
+    by_file: Dict[str, List[str]] = {}
+    for r in ws.select(a.repo, a.group):
+        zname = r.repo_name_in(tgt.key)
+        if zname is None or r.name in a.skip_existing:
+            continue
+        upstream_name = r.repo_name_in(ws.upstream_key)
+        ctx = dict(prov.get("vars", {}))
+        ctx.update({
+            "name": zname, "description": r.description.replace('"', "'"), "has_dockerfile": r.has_dockerfile,
+            "is_mirror": upstream_name is not None, "upstream_org": ws.upstream.github_org,
+            "upstream_name": upstream_name or "", "default_branch": r.branch_in(tgt.key),
+            "github_org": tgt.github_org, "letter": zname[0], "range": LETTER_RANGES.get(zname[0], "?"),
+        })
+        target_file = prov.get("target_path", "{name}.yaml").format(**ctx)
+        by_file.setdefault(target_file, []).append(render(template, ctx))
+    out_dir = Path(a.out) if a.out else None
+    if a.out == "auto":
+        if not ws.profile_dir:
+            sys.exit(err("--out auto needs an active enterprise (enterprises/<name>/)"))
+        out_dir = ws.profile_dir / "rbac"
+    for f, entries in by_file.items():
+        header = (f"# --- generated by reactory-repos provision --to {tgt.key} (profile {ws.profile_name}) on "
+                  f"{dt.date.today().isoformat()} ---\n# Target: {prov['system']} {f}\n")
+        text = header + "\n".join(entries)
+        if out_dir:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            p = out_dir / (f.replace("/", "_") + ".fragment")
+            p.write_text(text)
+            print(f"wrote {p} ({len(entries)} repos)")
+        else:
+            print(text)
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# security policy: audit / harden / seed an organisation's repositories
+# ----------------------------------------------------------------------------
+class GhError(Exception):
+    pass
+
+
+def gh_api(method: str, path: str, body: Optional[dict] = None) -> Tuple[int, object]:
+    """GitHub REST call through `gh api`. Returns (http status, parsed body or None)."""
+    args = ["gh", "api", "-i", "-X", method, path, "-H", "Accept: application/vnd.github+json"]
+    inp = None
+    if body is not None:
+        args += ["--input", "-"]
+        inp = json.dumps(body)
+    cp = subprocess.run(args, input=inp, text=True, capture_output=True)
+    m = re.match(r"HTTP/[\d.]+ (\d+)", cp.stdout)
+    if not m:
+        raise GhError(last_line(cp.stderr) or "gh api produced no HTTP response")
+    status = int(m.group(1))
+    sep = "\r\n\r\n" if "\r\n\r\n" in cp.stdout else "\n\n"
+    body_txt = cp.stdout.split(sep, 1)[1].strip() if sep in cp.stdout else ""
+    data: object = None
+    if body_txt:
+        try:
+            data = json.loads(body_txt)
+        except json.JSONDecodeError:
+            data = body_txt
+    return status, data
+
+
+def api_msg(data: object) -> str:
+    return data.get("message", str(data)) if isinstance(data, dict) else str(data)
+
+
+def strip_comments(obj):
+    """Drop `"// key"` comment entries recursively (load_jsonc keeps them)."""
+    if isinstance(obj, dict):
+        return {k: strip_comments(v) for k, v in obj.items() if not k.startswith("//")}
+    if isinstance(obj, list):
+        return [strip_comments(x) for x in obj]
+    return obj
+
+
+def load_policy(org: Org) -> dict:
+    if not org.policy_path:
+        sys.exit(err(f"org '{org.key}' has no `policy` in its configuration (repos.json / profile)"))
+    p = (TOOL_ROOT / org.policy_path).resolve()
+    if not p.exists():
+        sys.exit(err(f"policy file {p} not found"))
+    return strip_comments(load_jsonc(p))
+
+
+class Finding:
+    """One control on one repo: status True (ok) / False (drift) / None (not applicable)."""
+    def __init__(self, control: str, status: Optional[bool], detail: str = ""):
+        self.control, self.status, self.detail = control, status, detail
+
+
+def repo_state(gh_org: str, name: str, file_paths: List[str]) -> dict:
+    """Everything audit/harden need about one GitHub repository, in ~12 API calls."""
+    st: dict = {"name": name}
+    s, repo = gh_api("GET", f"repos/{gh_org}/{name}")
+    if s == 404:
+        st["missing"] = True
+        return st
+    if s != 200:
+        st["error"] = f"{s} {api_msg(repo)}"
+        return st
+    st["repo"] = repo
+    st["public"] = repo.get("visibility") == "public"
+    st["default_branch"] = repo.get("default_branch")
+    sa = repo.get("security_and_analysis") or {}
+    st["secret_scanning"] = (sa.get("secret_scanning") or {}).get("status") == "enabled"
+    st["secret_scanning_push_protection"] = (sa.get("secret_scanning_push_protection") or {}).get("status") == "enabled"
+    s, _ = gh_api("GET", f"repos/{gh_org}/{name}/vulnerability-alerts")
+    st["dependabot_alerts"] = s == 204
+    s, d = gh_api("GET", f"repos/{gh_org}/{name}/automated-security-fixes")
+    st["dependabot_security_updates"] = s == 200 and isinstance(d, dict) and bool(d.get("enabled"))
+    s, d = gh_api("GET", f"repos/{gh_org}/{name}/private-vulnerability-reporting")
+    st["private_vulnerability_reporting"] = s == 200 and isinstance(d, dict) and bool(d.get("enabled"))
+    s, d = gh_api("GET", f"repos/{gh_org}/{name}/actions/permissions")
+    st["actions"] = d if s == 200 and isinstance(d, dict) else {}
+    st["selected_actions"] = {}
+    if st["actions"].get("allowed_actions") == "selected":
+        s, d = gh_api("GET", f"repos/{gh_org}/{name}/actions/permissions/selected-actions")
+        st["selected_actions"] = d if s == 200 and isinstance(d, dict) else {}
+    s, d = gh_api("GET", f"repos/{gh_org}/{name}/actions/permissions/workflow")
+    st["workflow"] = d if s == 200 and isinstance(d, dict) else {}
+    s, d = gh_api("GET", f"repos/{gh_org}/{name}/actions/permissions/fork-pr-contributor-approval")
+    st["fork_pr_contributor_approval"] = d.get("approval_policy") if s == 200 and isinstance(d, dict) else None
+    s, d = gh_api("GET", f"repos/{gh_org}/{name}/branches/{st['default_branch']}/protection")
+    st["protection"] = d if s == 200 and isinstance(d, dict) else None
+    st["protection_available"] = s != 403          # 403 = private repo on the Free plan
+    st["protection_error"] = api_msg(d) if s not in (200, 404) else ""
+    st["files"] = {}
+    for p in file_paths:
+        s, _ = gh_api("GET", f"repos/{gh_org}/{name}/contents/{p}?ref={st['default_branch']}")
+        st["files"][p] = s == 200
+    return st
+
+
+def expected_contexts(policy: dict, repo: Repo) -> List[str]:
+    bp = policy["repo"].get("branch_protection", {})
+    ctx = list((bp.get("required_status_checks") or {}).get("contexts", []))
+    return sorted(set(ctx) | set(repo.required_checks))
+
+
+def evaluate_repo(policy: dict, repo: Repo, org: Org, st: dict) -> List[Finding]:
+    rp = policy["repo"]
+    f: List[Finding] = []
+    pub = st["public"]
+    f.append(Finding("default_branch", st["default_branch"] == repo.branch_in(org.key),
+                     f"{st['default_branch']} (configured {repo.branch_in(org.key)})"))
+    for k, v in rp.get("settings", {}).items():
+        if k == "allow_auto_merge" and not pub and not st["protection_available"]:
+            f.append(Finding(f"settings.{k}", None, "private repo: needs branch protection, n/a on Free")); continue
+        f.append(Finding(f"settings.{k}", st["repo"].get(k) == v, f"{st['repo'].get(k)}"))
+    sec = rp.get("security", {})
+    for k in ("secret_scanning", "secret_scanning_push_protection", "private_vulnerability_reporting"):
+        if sec.get(k):
+            f.append(Finding(f"security.{k}", (st[k] if pub else None), "private repo: n/a on Free" if not pub else ""))
+    for k in ("dependabot_alerts", "dependabot_security_updates"):
+        if sec.get(k):
+            f.append(Finding(f"security.{k}", st[k]))
+    act = rp.get("actions", {})
+    if act:
+        allowed_ok = st["actions"].get("allowed_actions") == act.get("allowed_actions")
+        f.append(Finding("actions.allowed_actions", allowed_ok, str(st["actions"].get("allowed_actions"))))
+        if act.get("allowed_actions") == "selected":
+            sel = st["selected_actions"]
+            sel_ok = allowed_ok and sel.get("github_owned_allowed") == act.get("github_owned_allowed", True) \
+                and sel.get("verified_allowed") == act.get("verified_allowed", True) \
+                and set(sel.get("patterns_allowed") or []) == set(act.get("patterns_allowed") or [])
+            f.append(Finding("actions.selected_actions", sel_ok))
+    wf = rp.get("workflow", {})
+    for k, v in wf.items():
+        f.append(Finding(f"workflow.{k}", st["workflow"].get(k) == v, str(st["workflow"].get(k))))
+    if rp.get("fork_pr_contributor_approval"):
+        if not pub:      # forks of private repos stay inside the org; GitHub rejects the setting (422)
+            f.append(Finding("fork_pr_contributor_approval", None, "private repo: n/a"))
+        else:
+            f.append(Finding("fork_pr_contributor_approval",
+                             st["fork_pr_contributor_approval"] == rp["fork_pr_contributor_approval"],
+                             str(st["fork_pr_contributor_approval"])))
+    bp = rp.get("branch_protection")
+    if bp:
+        if not st["protection_available"]:
+            f.append(Finding("branch_protection", None, "private repo: n/a on Free"))
+        elif st["protection"] is None:
+            f.append(Finding("branch_protection", False, "none"))
+        else:
+            p = st["protection"]
+            g = lambda k: bool((p.get(k) or {}).get("enabled"))
+            pr = p.get("required_pull_request_reviews")
+            want = bp.get("required_pull_request_reviews")
+            if want:
+                if not pr:
+                    f.append(Finding("protection.pull_request_reviews", False, "not required"))
+                else:
+                    f.append(Finding("protection.reviews.count", pr.get("required_approving_review_count", 0) >= want.get("required_approving_review_count", 1),
+                                     str(pr.get("required_approving_review_count", 0))))
+                    for k in ("require_code_owner_reviews", "dismiss_stale_reviews", "require_last_push_approval"):
+                        if k in want:
+                            f.append(Finding(f"protection.reviews.{k}", bool(pr.get(k)) == bool(want[k])))
+                    if "bypass_pull_request_allowances" in want:
+                        bpa = pr.get("bypass_pull_request_allowances") or {}
+                        have = sorted(u["login"] for u in bpa.get("users", [])) + sorted(t["slug"] for t in bpa.get("teams", [])) + sorted(a["slug"] for a in bpa.get("apps", []))
+                        w = want["bypass_pull_request_allowances"]
+                        wantl = sorted(w.get("users", [])) + sorted(w.get("teams", [])) + sorted(w.get("apps", []))
+                        f.append(Finding("protection.reviews.bypass_allowances", have == wantl, ",".join(have) or "none"))
+            rsc = p.get("required_status_checks")
+            exp = expected_contexts(policy, repo)
+            if exp:                      # no expected checks => nothing to require (strict alone is a no-op)
+                have_ctx = set((rsc or {}).get("contexts", []))
+                f.append(Finding("protection.status_checks", bool(rsc) and set(exp) <= have_ctx and
+                                 (not (bp["required_status_checks"].get("strict")) or bool(rsc.get("strict"))),
+                                 ",".join(sorted(have_ctx)) or "none"))
+            for k in ("enforce_admins", "required_signatures", "required_linear_history", "allow_force_pushes",
+                      "allow_deletions", "required_conversation_resolution", "lock_branch", "block_creations"):
+                if k in bp:
+                    f.append(Finding(f"protection.{k}", g(k) == bool(bp[k]), str(g(k))))
+    for e in policy.get("files", {}).get("entries", []):
+        if e.get("public_only") and not pub:
+            continue
+        f.append(Finding(f"file:{e['path']}", st["files"].get(e["path"], False)))
+    return f
+
+
+def has_submodules(ws: Workspace, repo: Repo) -> bool:
+    return any(r.kind == "submodule" and r.parent == repo.name for r in ws.repos)
+
+
+def gather(ws: Workspace, org: Org, policy: dict, repos: List[Repo], jobs: int = 8) -> Dict[str, dict]:
+    paths = [e["path"] for e in policy.get("files", {}).get("entries", [])]
+    out: Dict[str, dict] = {}
+    with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+        futs = {ex.submit(repo_state, org.github_org, r.repo_name_in(org.key), paths): r for r in repos}
+        for fu in cf.as_completed(futs):
+            out[futs[fu].name] = fu.result()
+    return out
+
+
+def org_state(org: Org) -> dict:
+    st: dict = {}
+    s, d = gh_api("GET", f"orgs/{org.github_org}")
+    st["org"] = d if s == 200 and isinstance(d, dict) else {}
+    s, d = gh_api("GET", f"orgs/{org.github_org}/actions/permissions")
+    st["actions"] = d if s == 200 and isinstance(d, dict) else None
+    st["actions_err"] = "" if s == 200 else api_msg(d)
+    st["selected_actions"] = None
+    if st["actions"] and st["actions"].get("allowed_actions") == "selected":
+        s, d = gh_api("GET", f"orgs/{org.github_org}/actions/permissions/selected-actions")
+        st["selected_actions"] = d if s == 200 and isinstance(d, dict) else None
+    s, d = gh_api("GET", f"orgs/{org.github_org}/actions/permissions/workflow")
+    st["workflow"] = d if s == 200 and isinstance(d, dict) else None
+    return st
+
+
+ADMIN_ORG_HINT = "needs the admin:org scope: `gh auth refresh -h github.com -s admin:org`"
+
+
+def evaluate_org(policy: dict, st: dict) -> List[Finding]:
+    f: List[Finding] = []
+    po = policy.get("org", {})
+    o = st["org"]
+    for k, v in po.items():
+        if k in ("actions", "workflow"):
+            continue
+        if k not in o:
+            f.append(Finding(f"org.{k}", None, "not visible with this token"))
+        else:
+            f.append(Finding(f"org.{k}", o.get(k) == v, f"{o.get(k)}" + (" (set in the web UI only)" if k == "two_factor_requirement_enabled" and o.get(k) != v else "")))
+    if "actions" in po:
+        if st["actions"] is None:
+            f.append(Finding("org.actions", None, ADMIN_ORG_HINT))
+        else:
+            a = st["actions"]; want = po["actions"]
+            okk = a.get("allowed_actions") == want.get("allowed_actions") and a.get("enabled_repositories") == want.get("enabled_repositories", a.get("enabled_repositories"))
+            if want.get("allowed_actions") == "selected" and st["selected_actions"] is not None:
+                sel = st["selected_actions"]
+                okk = okk and sel.get("github_owned_allowed") == want.get("github_owned_allowed", True) and sel.get("verified_allowed") == want.get("verified_allowed", True) \
+                    and set(sel.get("patterns_allowed") or []) == set(want.get("patterns_allowed") or [])
+            f.append(Finding("org.actions", okk, f"{a.get('allowed_actions')} / {a.get('enabled_repositories')}"))
+    if "workflow" in po:
+        if st["workflow"] is None:
+            f.append(Finding("org.workflow", None, ADMIN_ORG_HINT))
+        else:
+            w = st["workflow"]
+            f.append(Finding("org.workflow", all(w.get(k) == v for k, v in po["workflow"].items()),
+                             f"{w.get('default_workflow_permissions')} / approve PRs: {w.get('can_approve_pull_request_reviews')}"))
+    return f
+
+
+def mark(status: Optional[bool]) -> str:
+    return ok("ok ") if status else (dim("n/a") if status is None else err("DRIFT"))
+
+
+def cmd_audit(ws: Workspace, a) -> int:
+    org = ws.org(a.to)
+    policy = load_policy(org)
+    repos = [r for r in ws.select(a.repo, a.group) if r.in_org(org.key)]
+    print(bold(f"audit {org.github_org} against {org.policy_path}"))
+    print(bold("\norganisation"))
+    ofind = evaluate_org(policy, org_state(org))
+    for x in ofind:
+        print(f"  {mark(x.status)} {pad(x.control, 60)} {dim(x.detail)}")
+    print(bold(f"\nrepositories ({len(repos)})"))
+    states = gather(ws, org, policy, repos, a.jobs)
+    totals: Dict[str, int] = {}
+    report = {"org": org.github_org, "policy": org.policy_path, "repos": {}}
+    drift_repos = 0
+    for r in repos:
+        st = states[r.name]
+        if st.get("missing"):
+            print(f"  {pad(r.name, 38)} {dim('not provisioned')}"); continue
+        if st.get("error"):
+            print(f"  {pad(r.name, 38)} {err(st['error'])}"); continue
+        finds = evaluate_repo(policy, r, org, st)
+        bad = [x for x in finds if x.status is False]
+        na = [x for x in finds if x.status is None]
+        for x in bad:
+            totals[x.control] = totals.get(x.control, 0) + 1
+        report["repos"][r.name] = {"visibility": st["repo"].get("visibility"), "drift": [x.control for x in bad],
+                                   "n/a": [x.control for x in na], "ok": [x.control for x in finds if x.status]}
+        vis = st["repo"].get("visibility", "?")[:7]
+        if bad:
+            drift_repos += 1
+        line = f"  {pad(r.name, 38)} {pad(vis, 8)} {len(finds) - len(bad) - len(na):>2}/{len(finds) - len(na):<2} "
+        if a.verbose:
+            print(line)
+            for x in finds:
+                print(f"      {mark(x.status)} {pad(x.control, 50)} {dim(x.detail)}")
+        else:
+            print(line + (err(", ".join(x.control for x in bad)) if bad else ok("compliant")))
+    if totals:
+        print(bold("\ndrift by control (repos affected)"))
+        for k, v in sorted(totals.items(), key=lambda kv: -kv[1]):
+            print(f"  {v:>3}  {k}")
+    print()
+    print(ok("all audited repositories comply") if drift_repos == 0 else warn(f"{drift_repos} of {len(report['repos'])} repositories drift from the policy; run `harden --to {org.key} -n`"))
+    if a.json_out:
+        Path(a.json_out).write_text(json.dumps(report, indent=2) + "\n")
+        print(dim(f"report written to {a.json_out}"))
+    return 0 if drift_repos == 0 and not any(x.status is False for x in ofind) else 1
+
+
+def protection_body(policy: dict, repo: Repo, st: dict) -> dict:
+    bp = policy["repo"]["branch_protection"]
+    cur = st.get("protection") or {}
+    ctx = sorted(set(expected_contexts(policy, repo)) | set(((cur.get("required_status_checks") or {}).get("contexts")) or []))
+    rsc_pol = bp.get("required_status_checks")
+    body: dict = {
+        "required_status_checks": ({"strict": bool(rsc_pol.get("strict", True)), "contexts": ctx} if (rsc_pol and ctx) else None),
+        "enforce_admins": bool(bp.get("enforce_admins", True)),
+        "required_pull_request_reviews": None,
+        "restrictions": None,
+        "required_linear_history": bool(bp.get("required_linear_history", False)),
+        "allow_force_pushes": bool(bp.get("allow_force_pushes", False)),
+        "allow_deletions": bool(bp.get("allow_deletions", False)),
+        "block_creations": bool(bp.get("block_creations", False)),
+        "required_conversation_resolution": bool(bp.get("required_conversation_resolution", False)),
+        "lock_branch": bool(bp.get("lock_branch", False)),
+        "allow_fork_syncing": False,
+    }
+    want = bp.get("required_pull_request_reviews")
+    if want:
+        rv = {
+            "dismiss_stale_reviews": bool(want.get("dismiss_stale_reviews", True)),
+            "require_code_owner_reviews": bool(want.get("require_code_owner_reviews", True)),
+            "required_approving_review_count": int(want.get("required_approving_review_count", 1)),
+            "require_last_push_approval": bool(want.get("require_last_push_approval", False)),
+        }
+        if "bypass_pull_request_allowances" in want:
+            rv["bypass_pull_request_allowances"] = want["bypass_pull_request_allowances"]
+        body["required_pull_request_reviews"] = rv
+    restr = bp.get("restrictions", "keep")
+    if restr == "keep":
+        cr = cur.get("restrictions")
+        if cr:
+            body["restrictions"] = {"users": [u["login"] for u in cr.get("users", [])],
+                                    "teams": [t["slug"] for t in cr.get("teams", [])],
+                                    "apps": [x["slug"] for x in cr.get("apps", [])]}
+    elif isinstance(restr, dict):
+        body["restrictions"] = {"users": restr.get("users", []), "teams": restr.get("teams", []), "apps": restr.get("apps", [])}
+    return body
+
+
+def harden_repo(policy: dict, repo: Repo, org: Org, st: dict, dry_run: bool) -> List[str]:
+    """Apply the repo-level policy; returns a list of actions taken (or planned)."""
+    rp = policy["repo"]
+    base = f"repos/{org.github_org}/{repo.repo_name_in(org.key)}"
+    done: List[str] = []
+    finds = {x.control: x for x in evaluate_repo(policy, repo, org, st)}
+    bad = {k for k, x in finds.items() if x.status is False}
+
+    def do(label: str, method: str, path: str, body: Optional[dict] = None, good=(200, 204)):
+        if dry_run:
+            done.append(label); return
+        s, d = gh_api(method, path, body)
+        done.append(label if s in good else err(f"{label}: {s} {api_msg(d)}"))
+
+    patch = {k: v for k, v in rp.get("settings", {}).items() if f"settings.{k}" in bad}
+    sa = {}
+    if st["public"]:
+        if "security.secret_scanning" in bad:
+            sa["secret_scanning"] = {"status": "enabled"}
+        if "security.secret_scanning_push_protection" in bad:
+            sa["secret_scanning_push_protection"] = {"status": "enabled"}
+    if sa:
+        patch["security_and_analysis"] = sa
+    if patch:
+        do("settings: " + ", ".join(patch), "PATCH", base, patch)
+    if "security.dependabot_alerts" in bad:
+        do("dependabot alerts on", "PUT", f"{base}/vulnerability-alerts")
+    if "security.dependabot_security_updates" in bad:
+        do("dependabot security updates on", "PUT", f"{base}/automated-security-fixes")
+    if "security.private_vulnerability_reporting" in bad:
+        do("private vulnerability reporting on", "PUT", f"{base}/private-vulnerability-reporting")
+    act = rp.get("actions", {})
+    if "actions.allowed_actions" in bad or "actions.selected_actions" in bad:
+        do(f"actions: allowed={act.get('allowed_actions')}", "PUT", f"{base}/actions/permissions",
+           {"enabled": True, "allowed_actions": act.get("allowed_actions")})
+        if act.get("allowed_actions") == "selected":
+            do("actions: GitHub-owned + verified creators only", "PUT", f"{base}/actions/permissions/selected-actions",
+               {"github_owned_allowed": act.get("github_owned_allowed", True), "verified_allowed": act.get("verified_allowed", True),
+                "patterns_allowed": act.get("patterns_allowed", [])})
+    if any(k.startswith("workflow.") for k in bad):
+        do("actions: read-only GITHUB_TOKEN, no PR approvals", "PUT", f"{base}/actions/permissions/workflow", rp["workflow"])
+    if "fork_pr_contributor_approval" in bad:
+        do(f"fork PR approval: {rp['fork_pr_contributor_approval']}", "PUT", f"{base}/actions/permissions/fork-pr-contributor-approval",
+           {"approval_policy": rp["fork_pr_contributor_approval"]})
+    bp = rp.get("branch_protection")
+    if bp and st["protection_available"]:
+        prot_bad = [k for k in bad if k.startswith("protection.") or k == "branch_protection"]
+        sig_only = prot_bad == ["protection.required_signatures"]
+        if prot_bad and not sig_only:
+            body = protection_body(policy, repo, st)
+            do(f"branch protection on {st['default_branch']}: " + ", ".join(sorted(k.replace('protection.', '') for k in prot_bad if k != 'protection.required_signatures')),
+               "PUT", f"{base}/branches/{st['default_branch']}/protection", body)
+        if "protection.required_signatures" in bad:
+            if bp.get("required_signatures"):
+                do("require signed commits", "POST", f"{base}/branches/{st['default_branch']}/protection/required_signatures")
+            else:
+                do("signed commits no longer required", "DELETE", f"{base}/branches/{st['default_branch']}/protection/required_signatures")
+    elif bp and not st["protection_available"]:
+        done.append(dim("branch protection: n/a (private repo on the Free plan)"))
+    return done
+
+
+def cmd_harden(ws: Workspace, a) -> int:
+    org = ws.org(a.to)
+    policy = load_policy(org)
+    verb = "would apply" if a.dry_run else "applied"
+    rc = 0
+    if a.org_level:
+        print(bold(f"organisation {org.github_org}"))
+        po = policy.get("org", {})
+        ost = org_state(org)
+        simple = {k: v for k, v in po.items() if k not in ("actions", "workflow", "two_factor_requirement_enabled") and ost["org"].get(k) != v}
+        if ost["org"].get("two_factor_requirement_enabled") is False and po.get("two_factor_requirement_enabled"):
+            print(f"  {warn('manual')} require two-factor authentication: Settings > Authentication security (no API)")
+        steps = []
+        if simple:
+            steps.append((f"org settings: {', '.join(simple)}", "PATCH", f"orgs/{org.github_org}", simple))
+        if "actions" in po:
+            want = po["actions"]
+            steps.append((f"org actions: allowed={want.get('allowed_actions')}", "PUT", f"orgs/{org.github_org}/actions/permissions",
+                          {"enabled_repositories": want.get("enabled_repositories", "all"), "allowed_actions": want.get("allowed_actions")}))
+            if want.get("allowed_actions") == "selected":
+                steps.append(("org actions: GitHub-owned + verified creators only", "PUT", f"orgs/{org.github_org}/actions/permissions/selected-actions",
+                              {"github_owned_allowed": want.get("github_owned_allowed", True), "verified_allowed": want.get("verified_allowed", True),
+                               "patterns_allowed": want.get("patterns_allowed", [])}))
+        if "workflow" in po:
+            steps.append(("org actions: read-only GITHUB_TOKEN, no PR approvals", "PUT", f"orgs/{org.github_org}/actions/permissions/workflow", po["workflow"]))
+        for label, method, path, body in steps:
+            if a.dry_run:
+                print(f"  {verb}: {label}"); continue
+            s, d = gh_api(method, path, body)
+            if s in (200, 204):
+                print(f"  {ok('applied')} {label}")
+            else:
+                rc = 1
+                print(f"  {err('failed ')} {label}: {s} {api_msg(d)}" + (f" ({ADMIN_ORG_HINT})" if s in (403, 404) else ""))
+        if not steps:
+            print(f"  {ok('ok')} nothing to change")
+        if a.org_only:
+            return rc
+    repos = [r for r in ws.select(a.repo, a.group) if r.in_org(org.key)]
+    print(bold(f"\nrepositories in {org.github_org} ({len(repos)})"))
+    bp = policy["repo"].get("branch_protection", {})
+    if bp.get("enforce_admins") and (bp.get("required_pull_request_reviews") or {}).get("required_approving_review_count", 0) > 0:
+        print(warn("  note: enforce_admins + required reviews means NOBODY, administrators included, can merge their own PR "
+                   f"into {org.default_branch} without another reviewer's approval."))
+    states = gather(ws, org, policy, repos, a.jobs)
+    for r in repos:
+        st = states[r.name]
+        if st.get("missing") or st.get("error"):
+            print(f"  {pad(r.name, 38)} {dim(st.get('error') or 'not provisioned')}"); continue
+        acts = harden_repo(policy, r, org, st, a.dry_run)
+        if not acts:
+            print(f"  {pad(r.name, 38)} {ok('compliant')}"); continue
+        print(f"  {pad(r.name, 38)} {verb}:")
+        for x in acts:
+            print(f"      - {x}")
+            if "failed" in ANSI.sub("", x) or ANSI.sub("", x).split(":")[-1].strip()[:3].isdigit():
+                rc = 1
+    if a.dry_run:
+        print(dim("\n(dry run; drop -n to apply)"))
+    return rc
+
+
+def seed_repo(ws: Workspace, policy: dict, repo: Repo, org: Org, st: dict, dry_run: bool, do_pr: bool,
+              auto_merge: bool = True) -> str:
+    files = policy.get("files")
+    if not files:
+        return dim("policy has no files section")
+    if not repo.exists:
+        return dim("skip: not cloned locally")
+    # the seed branch is built in a worktree from the remote ref, so a dirty local tree is irrelevant
+    _, fres = fetch_one(repo, [org.remote], prune=False)
+    if fres.get(org.remote) != "ok":
+        return warn(f"skip: {org.remote} {fres.get(org.remote)}")
+    branch = repo.branch_in(org.key)
+    ref = f"{org.remote}/{branch}"
+    if not ref_exists(repo.path, ref):
+        return warn(f"skip: {ref} does not exist")
+    ctx = {k: (" ".join(v) if isinstance(v, list) else v) for k, v in files.get("vars", {}).items()}
+    ctx.update({"name": repo.repo_name_in(org.key), "default_branch": branch, "github_org": org.github_org,
+                "has_submodules": has_submodules(ws, repo), "is_public": st.get("public", False),
+                "has_dockerfile": repo.has_dockerfile,
+                "dockerfile_at_root": (repo.path / "Dockerfile").exists(),
+                "has_npm": "npm" in repo.package_ecosystems, "has_pip": "pip" in repo.package_ecosystems,
+                "codeql_languages": ",".join(repo.codeql_languages)})
+    tdir = (TOOL_ROOT / files["dir"]).resolve()
+    plan: List[Tuple[str, str, str]] = []
+    for e in files.get("entries", []):
+        if e.get("public_only") and not ctx["is_public"]:
+            continue
+        tpl = tdir / e["path"]
+        if not tpl.exists():
+            return err(f"template missing: {tpl}")
+        content = render(tpl.read_text(), ctx)
+        content = re.sub(r"\n{3,}", "\n\n", content)
+        exists = git_ok(repo.path, "cat-file", "-e", f"{ref}:{e['path']}")
+        if exists and e.get("mode", "managed") == "create-only":
+            continue
+        if exists and git_out(repo.path, "show", f"{ref}:{e['path']}").strip() == content.strip():
+            continue
+        plan.append((e["path"], content, "update" if exists else "add"))
+    if not plan:
+        return ok("up to date")
+    summary = ", ".join(f"{m} {p}" for p, _, m in plan)
+    if dry_run:
+        return f"would {summary}"
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M")
+    seed_branch = f"{files.get('branch_prefix', 'security/baseline')}-{stamp}"
+    wt_dir = Path(tempfile.mkdtemp(prefix=f"reactory-seed-{repo.name}-"))
+    git(repo.path, "worktree", "add", "--detach", str(wt_dir), ref)
+    try:
+        git(wt_dir, "checkout", "-q", "-b", seed_branch)
+        for p, content, _ in plan:
+            (wt_dir / p).parent.mkdir(parents=True, exist_ok=True)
+            (wt_dir / p).write_text(content)
+            git(wt_dir, "add", "--", p)
+        msg = f"Security baseline ({policy.get('name', 'policy')}): " + ", ".join(p for p, _, _ in plan)
+        git(wt_dir, "commit", "-q", "--no-verify", "-m", msg)
+        sha = git_out(wt_dir, "rev-parse", "--short", "HEAD")
+        cp = git(wt_dir, "push", "-q", org.remote, f"{seed_branch}:{seed_branch}", check=False)
+        if cp.returncode != 0:
+            return err(f"commit {sha} ok; push failed: {last_line(cp.stderr)}")
+        result = f"{summary} -> {seed_branch} @ {sha}, pushed to {org.remote}"
+        if do_pr:
+            title = f"{org.pr_title_prefix + ': ' if org.pr_title_prefix else ''}Security baseline: {', '.join(p for p, _, _ in plan)}"
+            body = (f"Baseline security files from `reactory-workspace` policy **{policy.get('name')}** "
+                    f"(`{org.policy_path}`), applied by `reactory-repos seed --to {org.key}`.\n\n"
+                    + "\n".join(f"- `{m}` `{p}`" for p, _, m in plan)
+                    + "\n\nManaged files are overwritten by the next seed; edit the template under "
+                    f"`{files['dir']}` instead. Create-only files are yours after this PR.\n") + pr_body_footer(org.pr_merge_method)
+            good, url, note = gh_pr_create(org, repo, seed_branch, title, body)
+            result += "; " + (ok("PR: " + url) + (f" ({note})" if note else "") if good else err("gh pr create failed: " + note))
+            if good and auto_merge:
+                result += "; " + arm_auto_merge(org, repo, url, org.pr_merge_method)
+        return result
+    finally:
+        git(repo.path, "worktree", "remove", "--force", str(wt_dir), check=False)
+        shutil.rmtree(wt_dir, ignore_errors=True)
+        git(repo.path, "worktree", "prune", check=False)
+
+
+def cmd_seed(ws: Workspace, a) -> int:
+    org = ws.org(a.to)
+    policy = load_policy(org)
+    repos = [r for r in ws.select(a.repo, a.group) if r.in_org(org.key)]
+    print(bold(f"seed {org.github_org} with baseline files from {policy.get('files', {}).get('dir')}"))
+    states = gather(ws, org, policy, repos, a.jobs)
+    rc = 0
+    for r in repos:
+        st = states[r.name]
+        if st.get("missing") or st.get("error"):
+            print(f"  {pad(r.name, 38)} {dim(st.get('error') or 'not provisioned')}"); continue
+        res = seed_repo(ws, policy, r, org, st, a.dry_run, a.pr, auto_merge=org.auto_merge and not a.no_auto_merge)
+        print(f"  {pad(r.name, 38)} {res}")
+        if "failed" in res or "missing" in res:
+            rc = 1
+    return rc
+
+
+# ----------------------------------------------------------------------------
+# cleanup: delete branches whose work has landed on the default branch
+# ----------------------------------------------------------------------------
+def pr_heads(full: str, state: str) -> Optional[Dict[str, set]]:
+    """head branch -> set of head SHAs of that repo's PRs in `state` (None when gh fails)."""
+    cp = run(["gh", "pr", "list", "--repo", full, "--state", state, "--limit", "500",
+              "--json", "headRefName,headRefOid", "-q", ".[] | \"\\(.headRefName) \\(.headRefOid)\""], check=False)
+    if cp.returncode != 0:
+        return None
+    out: Dict[str, set] = {}
+    for line in cp.stdout.splitlines():
+        name, _, sha = line.partition(" ")
+        if name:
+            out.setdefault(name, set()).add(sha)
+    return out
+
+
+def cleanup_repo(r: Repo, org: Org, prefixes: List[str], all_merged: bool, dry_run: bool, do_local: bool) -> str:
+    """Remote branches of `r` in `org` that are gone for good: the head of a merged PR (whatever the merge
+    method), or a tool branch (`prefixes`; every branch with --all-merged) that is an ancestor of the
+    default branch. Branches with an open PR and the default branch are never touched. With `do_local`,
+    local branches of the same names (or whose remote is gone and which have landed) go too."""
+    if not r.in_org(org.key):
+        return dim("skip: not present in this org")
+    _, fres = fetch_one(r, [org.remote], prune=True)
+    if fres.get(org.remote) != "ok":
+        return warn(f"skip: {org.remote} {fres.get(org.remote, 'no remote')}")
+    default = r.branch_in(org.key)
+    default_ref = f"{org.remote}/{default}"
+    if not ref_exists(r.path, default_ref):
+        return warn(f"skip: {default_ref} does not exist")
+    full = gh_full(org, r)
+    notes: List[str] = []
+    merged_prs = pr_heads(full, "merged")
+    if merged_prs is None:
+        merged_prs = {}; notes.append(warn("gh pr list failed; ancestry only"))
+    open_prs = pr_heads(full, "open") or {}
+    s, d = gh_api("GET", f"repos/{full}")
+    if s == 200 and isinstance(d, dict):
+        off = [k for k in ("delete_branch_on_merge", "allow_auto_merge") if not d.get(k)]
+        if off:
+            notes.append(warn("repo setting off: " + ", ".join(off)))
+    prefix = f"{org.remote}/"
+    branches = [b[len(prefix):] for b in git_out(r.path, "for-each-ref", "--format=%(refname:short)",
+                                                 f"refs/remotes/{org.remote}/").splitlines()]
+    plan: List[Tuple[str, str]] = []
+    moved: List[str] = []
+    for b in branches:
+        if b in ("HEAD", default) or b in open_prs:
+            continue
+        landed = git_ok(r.path, "merge-base", "--is-ancestor", f"{org.remote}/{b}", default_ref)
+        if b in merged_prs:
+            # squash/rebase merges leave no ancestry, so trust the PR, but only while the branch still
+            # points at the commit that was merged: new commits after the merge are not covered by it
+            tip = git_out(r.path, "rev-parse", f"refs/remotes/{org.remote}/{b}")
+            if landed or tip in merged_prs[b]:
+                plan.append((b, "PR merged"))
+            else:
+                moved.append(b)
+        elif landed and (all_merged or any(b.startswith(p) for p in prefixes)):
+            plan.append((b, f"in {default}"))
+    if moved:
+        notes.append(dim("kept, commits after the merged PR: " + ", ".join(moved)))
+    deleted: List[str] = []
+    failed: List[str] = []
+    if plan:
+        names = [b for b, _ in plan]
+        if dry_run:
+            return "; ".join([f"would delete {len(plan)}: " + ", ".join(f"{b} ({why})" for b, why in plan)] + notes)
+        if git_ok(r.path, "push", "--quiet", org.remote, "--delete", *names):
+            deleted = names
+        else:                                   # one by one, so a protected branch does not block the rest
+            for b in names:
+                (deleted if git_ok(r.path, "push", "--quiet", org.remote, "--delete", b) else failed).append(b)
+        git(r.path, "fetch", "--quiet", "--prune", org.remote, check=False)
+    out: List[str] = []
+    if deleted:
+        out.append(f"deleted {len(deleted)}: " + ", ".join(deleted))
+    if failed:
+        out.append(err("could not delete: " + ", ".join(failed)))
+    if do_local:
+        current = git_out(r.path, "branch", "--show-current")
+        local_gone = []
+        for b in git_out(r.path, "for-each-ref", "--format=%(refname:short)", "refs/heads/").splitlines():
+            if b in (current, default) or ref_exists(r.path, f"refs/remotes/{org.remote}/{b}"):
+                continue
+            if b in deleted or b in merged_prs or \
+                    (any(b.startswith(p) for p in prefixes) and git_ok(r.path, "merge-base", "--is-ancestor", b, default_ref)):
+                local_gone.append(b)
+        if local_gone:
+            if dry_run:
+                out.append(f"would delete local: {', '.join(local_gone)}")
+            else:
+                removed = [b for b in local_gone if git_ok(r.path, "branch", "-D", b)]
+                if removed:
+                    out.append(f"local: {', '.join(removed)}")
+    if not out:
+        out.append(ok("nothing to clean"))
+    return "; ".join(out + notes)
+
+
+def cmd_cleanup(ws: Workspace, a) -> int:
+    repos = ws.select(a.repo, a.group, include_missing=False)
+    targets = list(ws.orgs) if a.to == "all" else [a.to]
+    rc = 0
+    for key in targets:
+        org = ws.org(key)
+        prefixes = a.prefix or org.cleanup_prefixes
+        scope = "every branch merged into the default branch" if a.all_merged else \
+            "heads of merged PRs, and merged " + " ".join(p + "*" for p in prefixes)
+        print(bold(f"\ncleanup {org.github_org}: {scope}" + (" (dry run)" if a.dry_run else "")))
+        with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
+            futs = {ex.submit(cleanup_repo, r, org, prefixes, a.all_merged, a.dry_run, a.local): r for r in repos}
+            results = {futs[f]: f.result() for f in cf.as_completed(futs)}
+        for r in repos:
+            res = results[r]
+            print(f"  {pad(r.name, 38)} {res}")
+            if "could not" in res or "failed" in res:
+                rc = 1
+    return rc
+
+
+# ----------------------------------------------------------------------------
+# argparse
+# ----------------------------------------------------------------------------
+def build_parser(org_keys: List[str], ws_groups: List[str]) -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="reactory-repos", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                allow_abbrev=False)
+    p.add_argument("--inventory", default=str(INVENTORY), help="path to repos.json")
+    p.add_argument("--profile", help="enterprise (enterprises/<name>/profile.json); default $REACTORY_PROFILE, else the only enterprise present; 'none' for upstream only")
+    p.add_argument("--root", help="workspace root (default: $REACTORY_HOME, else the parent of this tool's folder)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(sp):
+        sp.add_argument("--repo", action="append", default=[], help="limit to repo name/path (repeatable)")
+        sp.add_argument("--group", action="append", default=[], help="limit to a group (" + ", ".join(list(ws_groups) + ["native"]) + ")")
+
+    def to_arg(sp, allow_all=False):
+        sp.add_argument("--to", required=True, choices=org_keys + (["all"] if allow_all else []), help="target org")
+
+    s = sub.add_parser("list", help="show inventory, profile and local state"); common(s)
+    s.add_argument("-v", "--verbose", action="store_true"); s.set_defaults(fn=cmd_list)
+    s = sub.add_parser("clone", help="clone missing repos from the primary org and wire up all remotes"); common(s)
+    s.add_argument("--https", action="store_true"); s.add_argument("--depth", type=int, default=0)
+    s.add_argument("--locked", action="store_true", help="check out the commit recorded in the lock file"); s.set_defaults(fn=cmd_clone)
+    s = sub.add_parser("remotes", help="ensure origin + one remote per org match the configuration"); common(s)
+    s.add_argument("--https", action="store_true"); s.set_defaults(fn=cmd_remotes)
+    s = sub.add_parser("fetch", help="fetch every org remote in every repo"); common(s)
+    s.add_argument("-j", "--jobs", type=int, default=8); s.add_argument("--no-prune", action="store_true"); s.set_defaults(fn=cmd_fetch)
+    s = sub.add_parser("status", help="branch, dirtiness and upstream<>mirror divergence per repo"); common(s)
+    s.add_argument("--fetch", action="store_true"); s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("exec", help="run a command in every selected repo: exec -- git log -1"); common(s)
+    s.add_argument("command", nargs=argparse.REMAINDER); s.set_defaults(fn=cmd_exec)
+    s = sub.add_parser("push", help="push the current branch of selected repos to ONE org"); common(s); to_arg(s)
+    s.add_argument("--branch"); s.add_argument("-u", "--set-upstream", action="store_true")
+    s.add_argument("--force-protected", action="store_true", help="allow pushing to a protected default branch")
+    s.add_argument("--pr", action="store_true", help="open a PR to the org's default branch and arm auto-merge (squash)")
+    s.add_argument("--title", help="PR title (default: subject of the last commit)"); s.add_argument("--body", help="PR body")
+    s.add_argument("--no-auto-merge", action="store_true"); s.set_defaults(fn=cmd_push)
+    s = sub.add_parser("sync", help="merge one org's default branch into another's (worktree based)"); common(s); to_arg(s, allow_all=True)
+    s.add_argument("--from", dest="from_org", choices=org_keys, help="source org (default: upstream for a mirror target, the single mirror otherwise)")
+    s.add_argument("--push", action="store_true"); s.add_argument("--pr", action="store_true", help="push a sync/ branch and open a PR with gh (auto-merge: merge commit)")
+    s.add_argument("--no-auto-merge", action="store_true", help="open the PR but leave merging to a human")
+    s.add_argument("--keep-worktree", action="store_true"); s.add_argument("-n", "--dry-run", action="store_true"); s.set_defaults(fn=cmd_sync)
+    s = sub.add_parser("bootstrap", help="first push of a repo's history into a freshly created org repo"); common(s); to_arg(s)
+    s.add_argument("--from", dest="from_org", choices=org_keys); s.add_argument("--branch")
+    s.add_argument("--pr", action="store_true"); s.add_argument("--https", action="store_true"); s.add_argument("--no-auto-merge", action="store_true")
+    s.add_argument("-n", "--dry-run", action="store_true"); s.set_defaults(fn=cmd_bootstrap)
+    s = sub.add_parser("init", help="git init a plain folder listed in the configuration"); common(s)
+    s.add_argument("--https", action="store_true"); s.add_argument("-n", "--dry-run", action="store_true"); s.set_defaults(fn=cmd_init)
+    s = sub.add_parser("lock", help="record the HEAD commit of every repo into the enterprise's lock.json (locks/upstream.lock.json without one)"); common(s); s.set_defaults(fn=cmd_lock)
+    s = sub.add_parser("checkout-lock", help="detach every repo at the commit in the lock file"); common(s)
+    s.add_argument("--force", action="store_true"); s.set_defaults(fn=cmd_checkout_lock)
+    s = sub.add_parser("check", help="verify remotes, relative submodule URLs, gh auth, org membership, lock"); s.set_defaults(fn=cmd_check)
+    s = sub.add_parser("provision", help="render repository definitions for an org's repo-management system"); common(s); to_arg(s)
+    s.add_argument("--skip-existing", action="append", default=[]); s.add_argument("--out", help="write *.fragment files here instead of stdout ('auto' = enterprises/<name>/rbac)")
+    s.set_defaults(fn=cmd_provision)
+    s = sub.add_parser("enterprise", help="enterprise configuration repos under enterprises/: list | add <git-url> | init <name>")
+    s.add_argument("action", choices=["list", "add", "init"]); s.add_argument("arg", nargs="?", help="git URL (add) or name (init)")
+    s.add_argument("--name", help="folder name for add (default: repo name without a reactory-workspace- prefix)"); s.set_defaults(fn=cmd_enterprise)
+    s = sub.add_parser("audit", help="compare an org and its repositories with the org's security policy (read-only)"); common(s); to_arg(s)
+    s.add_argument("-v", "--verbose", action="store_true", help="every control per repo, not only drift")
+    s.add_argument("-j", "--jobs", type=int, default=8); s.add_argument("--json", dest="json_out", help="also write a JSON report here")
+    s.set_defaults(fn=cmd_audit)
+    s = sub.add_parser("harden", help="apply the org's security policy to its repositories (and, with --org-level, the org)"); common(s); to_arg(s)
+    s.add_argument("-n", "--dry-run", action="store_true"); s.add_argument("-j", "--jobs", type=int, default=8)
+    s.add_argument("--org-level", action="store_true", help="also apply organisation settings (needs admin:org)")
+    s.add_argument("--org-only", action="store_true", help="with --org-level: stop after the organisation settings")
+    s.set_defaults(fn=cmd_harden)
+    s = sub.add_parser("seed", help="open PRs adding the policy's baseline files (SECURITY.md, dependabot, CodeQL, ...) to each repo"); common(s); to_arg(s)
+    s.add_argument("-n", "--dry-run", action="store_true"); s.add_argument("--pr", action="store_true", help="open a pull request after pushing the branch (auto-merge: squash)")
+    s.add_argument("--no-auto-merge", action="store_true"); s.add_argument("-j", "--jobs", type=int, default=8); s.set_defaults(fn=cmd_seed)
+    s = sub.add_parser("cleanup", help="delete remote branches that have landed: heads of merged PRs and merged sync/ security/ import/ branches"); common(s); to_arg(s, allow_all=True)
+    s.add_argument("-n", "--dry-run", action="store_true"); s.add_argument("-j", "--jobs", type=int, default=8)
+    s.add_argument("--all-merged", action="store_true", help="also delete any other branch that is an ancestor of the default branch")
+    s.add_argument("--prefix", action="append", default=[], help="branch prefixes to treat as tool branches (default: org's cleanup_branch_prefixes)")
+    s.add_argument("--local", action="store_true", help="also delete the matching local branches")
+    s.set_defaults(fn=cmd_cleanup)
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # pre-parse the global options so org choices can come from the configuration
+    pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)   # --pr must not match --profile
+    pre.add_argument("--inventory", default=str(INVENTORY)); pre.add_argument("--profile"); pre.add_argument("--root")
+    g, rest = pre.parse_known_args(argv)
+    if rest[:1] == ["enterprise"] and g.profile is None:
+        g.profile = "none"          # listing/adding enterprises must work before any profile is valid
+    ws = Workspace(Path(g.inventory).resolve(), g.profile, g.root)
+    a = build_parser(list(ws.orgs), list(ws.groups)).parse_args(argv)
+    if a.cmd == "exec":
+        if a.command[:1] == ["--"]:
+            a.command = a.command[1:]
+        if not a.command:
+            sys.exit("exec needs a command after --")
+    return a.fn(ws, a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

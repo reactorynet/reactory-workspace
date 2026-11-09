@@ -1,0 +1,100 @@
+{
+  "// about": "Security policy for a PUBLIC upstream organisation on the GitHub Free plan. `audit --to <org>` compares the live org and repos with this file; `harden --to <org>` applies the repo-level and (with --org-level) org-level parts; `seed --to <org>` opens PRs adding the files below. Everything here is reachable with the `repo` scope except `org`, which needs `admin:org`.",
+  "name": "public-upstream",
+
+  "org": {
+    "// two_factor": "Cannot be set through the API; reported by audit, applied in Settings > Authentication security.",
+    "two_factor_requirement_enabled": true,
+    "members_can_create_repositories": false,
+    "members_can_create_public_repositories": false,
+    "default_repository_permission": "read",
+    "dependabot_alerts_enabled_for_new_repositories": true,
+    "dependabot_security_updates_enabled_for_new_repositories": true,
+    "dependency_graph_enabled_for_new_repositories": true,
+    "secret_scanning_enabled_for_new_repositories": true,
+    "secret_scanning_push_protection_enabled_for_new_repositories": true,
+    "actions": {
+      "enabled_repositories": "all",
+      "allowed_actions": "selected",
+      "github_owned_allowed": true,
+      "verified_allowed": true,
+      "patterns_allowed": []
+    },
+    "workflow": {
+      "default_workflow_permissions": "read",
+      "can_approve_pull_request_reviews": false
+    }
+  },
+
+  "repo": {
+    "// settings": "Plain repository fields (PATCH /repos). Merge hygiene: feature and seed PRs squash (title/body from the PR), sync PRs land as merge commits so both orgs keep a common ancestor, rebase is off because it rewrites history, GitHub performs the merge once reviews and checks pass (auto-merge) and deletes the head branch. `cleanup` removes branches that landed before this was on.",
+    "settings": {
+      "delete_branch_on_merge": true,
+      "allow_auto_merge": true,
+      "allow_merge_commit": true,
+      "allow_squash_merge": true,
+      "allow_rebase_merge": false,
+      "squash_merge_commit_title": "PR_TITLE",
+      "squash_merge_commit_message": "PR_BODY",
+      "allow_update_branch": true,
+      "web_commit_signoff_required": false
+    },
+    "// security": "secret scanning, push protection and private vulnerability reporting are free on PUBLIC repos only; private repos are reported as n/a.",
+    "security": {
+      "secret_scanning": true,
+      "secret_scanning_push_protection": true,
+      "private_vulnerability_reporting": true,
+      "dependabot_alerts": true,
+      "dependabot_security_updates": true
+    },
+    "actions": {
+      "allowed_actions": "selected",
+      "github_owned_allowed": true,
+      "verified_allowed": true,
+      "patterns_allowed": []
+    },
+    "workflow": {
+      "default_workflow_permissions": "read",
+      "can_approve_pull_request_reviews": false
+    },
+    "fork_pr_contributor_approval": "all_external_contributors",
+
+    "// branch_protection": "Applied to the default branch. Branch protection is free on public repos only. `required_linear_history` must stay false: cross-org sync lands as merge commits. `restrictions: keep` preserves whatever push restrictions a repo already has; use null to remove them or {users:[],teams:[],apps:[]} to set them. Per-repo `required_checks` in the inventory extends `required_status_checks.contexts`.",
+    "branch_protection": {
+      "required_pull_request_reviews": {
+        "required_approving_review_count": 1,
+        "require_code_owner_reviews": true,
+        "dismiss_stale_reviews": true,
+        "require_last_push_approval": true,
+        "bypass_pull_request_allowances": {"users": [], "teams": [], "apps": []}
+      },
+      "required_status_checks": {"strict": true, "contexts": []},
+      "enforce_admins": true,
+      "required_signatures": true,
+      "required_linear_history": false,
+      "allow_force_pushes": false,
+      "allow_deletions": false,
+      "required_conversation_resolution": true,
+      "lock_branch": false,
+      "block_creations": false,
+      "restrictions": "keep"
+    }
+  },
+
+  "// files": "Baseline files `seed` adds to every repo of the org through a PR. mode `managed` is overwritten on every seed; `create-only` is added when missing and never touched again. Templates live under `dir`; variables: name, default_branch, github_org, has_submodules, is_public, has_dockerfile, dockerfile_at_root plus `vars` (lists are space-joined).",
+  "files": {
+    "dir": "templates/upstream",
+    "branch_prefix": "security/baseline",
+    "vars": {
+      "codeowners": ["@wweber", "@zepzwweber"]
+    },
+    "entries": [
+      {"path": ".github/CODEOWNERS", "mode": "create-only"},
+      {"path": "SECURITY.md", "mode": "create-only"},
+      {"path": ".github/dependabot.yml", "mode": "managed"},
+      {"path": ".github/workflows/codeql.yml", "mode": "managed", "public_only": true},
+      {"path": ".github/workflows/dependency-review.yml", "mode": "managed", "public_only": true},
+      {"path": ".github/workflows/scorecard.yml", "mode": "managed", "public_only": true}
+    ]
+  }
+}

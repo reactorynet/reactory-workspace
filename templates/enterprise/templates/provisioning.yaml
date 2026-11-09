@@ -1,0 +1,37 @@
+# Example repository definition rendered by `provision --to <org>` once per
+# mirrored repo. Adapt it to your repo-management system (Terraform, a GitHub
+# App, a YAML catalogue, ...).
+# Variables (write them in double braces): name, description, default_branch,
+# upstream_org, upstream_name, github_org, letter, range, and everything under
+# provisioning.vars; a list renders as "- item" lines.
+# Conditionals: #if is_mirror ... /if and #if has_dockerfile ... /if, in the
+# same braces. Comments in this file are rendered too, so keep braces out of them.
+  {{name}}:
+    description: "{{description}}"
+    domain: "{{domain}}"
+    default_branch: "{{default_branch}}"
+    maintain_teams:
+      - "{{team}}"
+{{#if is_mirror}}    # Mirror of github.com/{{upstream_org}}/{{upstream_name}}: history is imported, so do
+    # NOT auto-initialise, and sync PRs must land as MERGE COMMITS (common ancestor).
+    auto_init: false
+{{/if}}    # Feature PRs squash; rebase off; auto-merge on; head branch deleted on merge.
+    allow_merge_commit: true
+    allow_squash_merge: true
+    allow_rebase_merge: false
+    allow_auto_merge: true
+    delete_branch_on_merge: true
+    squash_merge_commit_title: PR_TITLE
+    squash_merge_commit_message: PR_BODY
+    vulnerability_alerts: true
+    branch_protections:
+      - branch: "{{default_branch}}"
+        enforce_admins: true
+        required_signatures: true
+        required_linear_history: false     # cross-org sync needs merge commits
+        required_pull_request_reviews:
+          required_approving_review_count: 1
+          dismiss_stale_reviews: true
+          require_code_owner_reviews: true
+    topics:
+{{topics}}
