@@ -108,8 +108,16 @@ branch that was the default at the time; after `master` was made the
 default, `harden --repo reactory-temporal` protected `master`, auto-merge
 was armed on its already-approved PR and it squashed in at once, the first
 repo fully compliant; the stale protection on
-`feature/workflow-step-integration` was removed afterwards. Two
-private repos
+`feature/workflow-step-integration` was removed afterwards. Later the same
+day this repository itself was published as the private
+`reactorynet/reactory-workspace`, hardened and seeded (`CODEOWNERS`,
+`SECURITY.md`, an Actions-only `dependabot.yml`; CodeQL and the other
+workflows are public-only). Arming auto-merge on a private repo without
+branch protection merges the PR at once, which is how the workspace,
+`reactory-communicator` and `reactory-classroom` baselines landed; the
+remaining private ones (`reactor-express-client-config`,
+`booktutor-express-client-config`, `reactor-system-navigator`) were left for
+a human to merge. Two private repos
 (`reactory-telemetry-pwa-plugin`, `reactory-student-app-express-config`) are
 empty on GitHub and cannot be seeded until something is pushed. Org-level
 settings and the 2FA requirement are still pending (`admin:org`, web UI).
