@@ -409,11 +409,31 @@ def gh_pr_create(org: Org, repo: Repo, head: str, title: str, body: str) -> Tupl
     return False, "", last_line(cp.stderr)
 
 
+def base_is_protected(full: str, branch: str) -> Optional[bool]:
+    """True/False when GitHub answers, None when it cannot be determined (no permission, network)."""
+    try:
+        status, body = gh_api("GET", f"repos/{full}/branches/{branch}/protection")
+    except GhError:
+        return None
+    if status == 200:
+        return True
+    if status == 404:
+        return False
+    if status == 403 and isinstance(body, dict) and "upgrade" in str(body.get("message", "")).lower():
+        return False            # private repo on the Free plan: branch protection does not exist here
+    return None
+
+
 def arm_auto_merge(org: Org, repo: Repo, pr: str, method: str) -> str:
     """Ask GitHub to merge `pr` with `method` as soon as every requirement (reviews, checks) is met.
     If the PR already meets them, gh merges it right away. The head branch is removed by the repo's
     delete_branch_on_merge setting (policy / provisioning); `cleanup` is the backstop."""
     full = gh_full(org, repo)
+    base = run(["gh", "pr", "view", pr, "--repo", full, "--json", "baseRefName", "--jq", ".baseRefName"], check=False).stdout.strip()
+    if base and base_is_protected(full, base) is False:
+        # gh would not arm anything here: with nothing required, `--auto` merges the PR on the spot, unreviewed
+        return warn(f"auto-merge NOT armed: base '{base}' of {full} has no branch protection, so GitHub would merge "
+                    f"immediately without a review. Get a review, then: gh pr merge {pr} --repo {full} --{method}")
     cp = run(["gh", "pr", "merge", pr, "--repo", full, "--auto", f"--{method}"], check=False)
     if cp.returncode == 0:
         return ok(f"auto-merge armed ({method}); branch deleted on merge")
