@@ -68,6 +68,17 @@
       "description": "Reactory PWA core plugin (component registry entries compiled into the client)"
     },
     {
+      "name": "reactory-communicator-pwa-plugin",
+      "path": "reactory-pwa-client/src/components/plugins/reactory-communicator",
+      "kind": "submodule",
+      "parent": "reactory-pwa-client",
+      "groups": [
+        "platform"
+      ],
+      "upstream_branch": "main",
+      "description": "Reactory PWA communicator plugin (email / sms / notification UI)"
+    },
+    {
       "name": "reactory-telemetry-pwa-plugin",
       "path": "reactory-pwa-client/src/components/plugins/reactory-telemetry",
       "kind": "nested",
@@ -177,6 +188,18 @@
       ],
       "module_key": "reactory-slack",
       "description": "Reactory server module: Slack integration"
+    },
+    {
+      "name": "reactory-atlassian",
+      "path": "reactory-express-server/src/modules/reactory-atlassian",
+      "kind": "nested",
+      "parent": "reactory-express-server",
+      "groups": [
+        "platform"
+      ],
+      "module_key": "reactory-atlassian",
+      "description": "Reactory server module: Atlassian (Jira / Confluence) integration",
+      "note": "Upstream-owned (decided 2026-11-10). Not under version control yet: run `init --repo reactory-atlassian`, create the repo in the upstream org, then `push`."
     },
     {
       "name": "reactory-kyc",
