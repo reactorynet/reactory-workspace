@@ -132,6 +132,12 @@ and Actions controls (branch protection is n/a while it is private on the
 Free plan) and `seed --pr` opened its `security/baseline-*` PR, left for a
 human to merge for the same reason as the other private repos. Re-audit:
 15/18, the three baseline files being the open PR.
+Later the same day `reactory-telemetry-pwa-plugin`, one of the two
+repositories that were empty on 2026-11-09, received its first push the same
+way (a local branch, nine commits, pushed as `master`); `harden` had nothing
+left to apply since the settings had landed on the empty repository, and
+`seed --pr` opened its baseline PR, again left for a human. Re-audit: 15/18.
+`reactory-student-app-express-config` is now the only empty repository.
 
 **Applied 2026-11-12.** This repository was made public by republishing it
 rather than flipping the private one: GitHub keeps `refs/pull/*/head` for
