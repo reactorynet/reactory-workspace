@@ -81,7 +81,7 @@
     {
       "name": "reactory-telemetry-pwa-plugin",
       "path": "reactory-pwa-client/src/components/plugins/reactory-telemetry",
-      "kind": "nested",
+      "kind": "submodule",
       "parent": "reactory-pwa-client",
       "groups": [
         "platform"
