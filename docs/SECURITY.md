@@ -123,6 +123,16 @@ a human to merge. Two private repos
 empty on GitHub and cannot be seeded until something is pushed. Org-level
 settings and the 2FA requirement are still pending (`admin:org`, web UI).
 
+**Applied 2026-11-11.** `reactory-atlassian`, until then a local-only module
+folder, was created as a private repository in the upstream organisation,
+its `master` pushed with `push --to reactorynet --force-protected` (the only
+legitimate use of that flag: the repository had no branch and no protection
+yet), then `harden --repo reactory-atlassian` applied the settings, Dependabot
+and Actions controls (branch protection is n/a while it is private on the
+Free plan) and `seed --pr` opened its `security/baseline-*` PR, left for a
+human to merge for the same reason as the other private repos. Re-audit:
+15/18, the three baseline files being the open PR.
+
 ### 3.2 The control chain the policy creates
 
 ```mermaid

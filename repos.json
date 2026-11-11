@@ -199,7 +199,7 @@
       ],
       "module_key": "reactory-atlassian",
       "description": "Reactory server module: Atlassian (Jira / Confluence) integration",
-      "note": "Upstream-owned (decided 2026-11-10). Not under version control yet: run `init --repo reactory-atlassian`, create the repo in the upstream org, then `push`."
+      "note": "Upstream-owned (decided 2026-11-10). Created private in the upstream organisation 2026-11-11 and hardened; make it public once the module has had a review."
     },
     {
       "name": "reactory-kyc",
