@@ -130,6 +130,17 @@ bin/reactory-repos provision --to acme --out auto          # repo definitions ->
 bin/reactory-repos bootstrap --to acme --group platform --pr
 ```
 
+With `auto_init: false` the org repo is empty and `bootstrap` pushes the
+history straight in as the default branch. If the repo system initialised the
+default branch anyway (a root commit, possibly with distributed workflow
+files on top), GitHub refuses a PR from the bare upstream history because the
+two have no common ancestor. `bootstrap` then grafts the import branch: the
+org's default branch plus a merge of the upstream history
+(`--allow-unrelated-histories`), the org's `org_specific_paths` kept as they
+are, every other file both sides created taken from upstream. The import PR
+must land as a **merge commit**; that merge is the common ancestor every
+later `sync` relies on.
+
 ### Hardening an org's GitHub settings
 
 ```bash

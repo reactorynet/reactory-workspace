@@ -183,9 +183,9 @@ sequenceDiagram
     T->>GH: push reactorynet/master as import/reactorynet-master
     alt main does not exist (auto_init false)
         T->>GH: push reactorynet/master as main
-    else main exists (auto_init true)
-        T->>GH: gh pr create import/… → main
-        Dev->>GH: merge with a MERGE COMMIT
+    else main exists (auto-initialised, no common ancestor)
+        T->>T: graft import/… = main + merge of reactorynet/master (unrelated histories, org paths kept)
+        T->>GH: push import/…, gh pr create import/… → main (auto-merge: MERGE COMMIT)
     end
     Dev->>T: status --fetch
     T-->>Dev: reactorynet<>acme in sync

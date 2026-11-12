@@ -410,17 +410,16 @@ def gh_pr_create(org: Org, repo: Repo, head: str, title: str, body: str) -> Tupl
 
 
 def base_is_protected(full: str, branch: str) -> Optional[bool]:
-    """True/False when GitHub answers, None when it cannot be determined (no permission, network)."""
+    """True/False when GitHub answers, None when it cannot be determined (no permission, network).
+    Reads the branch itself, whose `protected` flag is visible to anyone who can read the repo; the
+    `/protection` endpoint answers 404 to a token without admin on the repo, which would wrongly
+    read as "unprotected" (a maintainer in a mirror org is the normal case)."""
     try:
-        status, body = gh_api("GET", f"repos/{full}/branches/{branch}/protection")
+        status, body = gh_api("GET", f"repos/{full}/branches/{branch}")
     except GhError:
         return None
-    if status == 200:
-        return True
-    if status == 404:
-        return False
-    if status == 403 and isinstance(body, dict) and "upgrade" in str(body.get("message", "")).lower():
-        return False            # private repo on the Free plan: branch protection does not exist here
+    if status == 200 and isinstance(body, dict) and "protected" in body:
+        return bool(body["protected"])
     return None
 
 
@@ -752,6 +751,42 @@ def cmd_sync(ws: Workspace, a) -> int:
     return rc
 
 
+def graft_import_branch(r: Repo, src: Optional[Org], tgt: Org, src_ref: str, tgt_ref: str,
+                        import_branch: str) -> Tuple[Optional[str], str]:
+    """Build `import_branch` = `tgt_ref` + a merge of `src_ref` for histories with no common
+    ancestor (an auto-initialised default branch) and push it, replacing an earlier push of the
+    bare source history. The target org's own paths keep the target's version and the source
+    org's own paths never cross (as in `sync`); any other file both sides created takes the
+    imported version, since the auto-initialised copy is a placeholder."""
+    src_sha = git_out(r.path, "rev-parse", src_ref)   # `HEAD` would mean the worktree's HEAD below
+    wt_dir = Path(tempfile.mkdtemp(prefix=f"reactory-import-{r.name}-"))
+    git(r.path, "worktree", "add", "--detach", str(wt_dir), tgt_ref)
+    try:
+        git(wt_dir, "merge", "--no-ff", "--no-commit", "--no-edit", "--allow-unrelated-histories", src_sha, check=False)
+        keep, drop = list(tgt.org_specific_paths), (list(src.org_specific_paths) if src else [])
+        actions = apply_org_specific_paths(wt_dir, tgt_ref, keep, drop)
+        for path in git_out(wt_dir, "diff", "--name-only", "--diff-filter=U").splitlines():
+            if git_ok(wt_dir, "cat-file", "-e", f"{src_sha}:{path}"):
+                git(wt_dir, "checkout", src_sha, "--", path)
+                actions.append(f"take {path} from {src_ref} (both histories created it)")
+            else:
+                git(wt_dir, "rm", "-q", "--force", "--", path, check=False)
+                actions.append(f"drop {path} (absent in {src_ref})")
+        src_desc = f"{src.github_org}/{r.repo_name_in(src.key)}@{r.branch_in(src.key)}" if src else f"local {src_ref}"
+        msg = (f"Import {src_desc} onto the auto-initialised {tgt.github_org}/{r.repo_name_in(tgt.key)}"
+               f"@{r.branch_in(tgt.key)}")
+        git(wt_dir, "commit", "-q", "--no-verify", "-m", msg + ("\n\n" + "\n".join(actions) if actions else ""))
+        sha = git_out(wt_dir, "rev-parse", "--short", "HEAD")
+        cp = git(wt_dir, "push", "-q", "--force-with-lease", tgt.remote, f"HEAD:refs/heads/{import_branch}", check=False)
+        if cp.returncode != 0:
+            return None, f"push of {import_branch} failed: {cp.stderr.strip()}"
+        return sha, (f" [{len(actions)} path(s): " + "; ".join(actions) + "]" if actions else "")
+    finally:
+        git(r.path, "worktree", "remove", "--force", str(wt_dir), check=False)
+        shutil.rmtree(wt_dir, ignore_errors=True)
+        git(r.path, "worktree", "prune", check=False)
+
+
 def cmd_bootstrap(ws: Workspace, a) -> int:
     """First push of a repo's history into an org where the repo was just created."""
     tgt = ws.org(a.to)
@@ -775,17 +810,36 @@ def cmd_bootstrap(ws: Workspace, a) -> int:
             src_ref = "HEAD"
             import_branch = a.branch or f"import/local-{git_out(r.path, 'branch', '--show-current') or 'head'}"
         print(f"{ok('import ')} {r.name}: {src_ref} -> {tgt.remote}/{import_branch}")
+        tgt_default = f"{tgt.remote}/{r.branch_in(tgt.key)}"
+        default_exists = ref_exists(r.path, tgt_default)
+        # An auto-initialised default branch (a root commit the repo system made) shares no
+        # commit with the imported history, and GitHub refuses a PR between two histories
+        # with no common ancestor. The import branch is then grafted: the target's default
+        # branch plus a merge of the source, so the PR (merged with a merge commit) gives
+        # both histories a common ancestor for every later sync.
+        grafted = default_exists and not git_ok(r.path, "merge-base", src_ref, tgt_default)
+        if default_exists:
+            n = git_out(r.path, "rev-list", "--count", tgt_default)
+            if grafted:
+                print(dim(f"         {tgt_default} already exists ({n} commit(s), auto-initialised) and shares no "
+                          f"history with {src_ref}: {import_branch} = {tgt_default} + merge of {src_ref} "
+                          f"(unrelated histories; {tgt.github_org}'s org-specific paths kept), then a PR "
+                          f"merged with a MERGE COMMIT."))
+            else:
+                print(dim(f"         {tgt_default} already exists ({n} commit(s)). Open a PR "
+                          f"{import_branch} -> {r.branch_in(tgt.key)} and merge it with a MERGE COMMIT."))
         if a.dry_run:
             continue
-        cp = git(r.path, "push", tgt.remote, f"{src_ref}:refs/heads/{import_branch}", check=False)
-        if cp.returncode != 0:
-            print(err(cp.stderr.strip())); rc = 1; continue
-        tgt_default = f"{tgt.remote}/{r.branch_in(tgt.key)}"
-        git(r.path, "fetch", "--quiet", tgt.remote, check=False)
-        if ref_exists(r.path, tgt_default):
-            n = git_out(r.path, "rev-list", "--count", tgt_default)
-            print(dim(f"         {tgt_default} already exists ({n} commit(s), auto-initialised). Open a PR "
-                      f"{import_branch} -> {r.branch_in(tgt.key)} and merge it with a MERGE COMMIT."))
+        if grafted:
+            sha, note = graft_import_branch(r, src, tgt, src_ref, tgt_default, import_branch)
+            if sha is None:
+                print(err("         " + note)); rc = 1; continue
+            print(dim(f"         grafted {import_branch} @ {sha}{note}"))
+        else:
+            cp = git(r.path, "push", tgt.remote, f"{src_ref}:refs/heads/{import_branch}", check=False)
+            if cp.returncode != 0:
+                print(err(cp.stderr.strip())); rc = 1; continue
+        if default_exists:
             if a.pr:
                 title = f"{tgt.pr_title_prefix + ': ' if tgt.pr_title_prefix else ''}Import {src.github_org + '/' if src else ''}{r.name} history"
                 body = "Initial import of the upstream history. Merge with a merge commit, never squash." + pr_body_footer(tgt.sync_merge_method)
@@ -795,7 +849,14 @@ def cmd_bootstrap(ws: Workspace, a) -> int:
                     print("         " + arm_auto_merge(tgt, r, url, tgt.sync_merge_method))
         else:
             print(dim(f"         {tgt_default} does not exist yet; also pushing as {r.branch_in(tgt.key)}"))
-            git(r.path, "push", tgt.remote, f"{src_ref}:refs/heads/{r.branch_in(tgt.key)}", check=False)
+            cp = git(r.path, "push", tgt.remote, f"{src_ref}:refs/heads/{r.branch_in(tgt.key)}", check=False)
+            if cp.returncode != 0:
+                # A protection rule on the default branch name can decline the push that creates it
+                # ("changes must be made through a pull request"), which only a bypass identity can do.
+                print(err(f"         creating {r.branch_in(tgt.key)} was refused: {last_line(cp.stderr)}. "
+                          f"{import_branch} is pushed; an identity that bypasses the protection has to create "
+                          f"{r.branch_in(tgt.key)} from it, or the protection has to allow branch creation."))
+                rc = 1
     return rc
 
 
