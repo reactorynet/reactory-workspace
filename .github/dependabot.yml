@@ -7,4 +7,24 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # CodeQL's init / analyze / upload-sarif share one config format and must
+      # run at the same version. A partial update fails hard:
+      #   Loaded a configuration file for version 'X', but running version 'Y'.
+      #   All steps in a workflow that use `github/codeql-action` must use the
+      #   same version to work correctly.
+      # Without this group Dependabot raises three separate PRs per repo, and
+      # none of them can ever pass on its own. Grouping keeps the trio in a
+      # single PR that does pass.
+      codeql-action:
+        patterns:
+          - "github/codeql-action/*"
+      # Non-breaking action bumps ride together. Majors are deliberately NOT
+      # included, so a checkout/setup-node/upload-artifact major still arrives
+      # on its own and gets a real review.
+      actions-minor-patch:
+        patterns:
+          - "actions/*"
+        update-types: [minor, patch]
 
