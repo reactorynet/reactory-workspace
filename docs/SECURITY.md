@@ -133,6 +133,25 @@ Free plan) and `seed --pr` opened its `security/baseline-*` PR, left for a
 human to merge for the same reason as the other private repos. Re-audit:
 15/18, the three baseline files being the open PR.
 
+**Applied 2026-11-12.** This repository was made public by republishing it
+rather than flipping the private one: GitHub keeps `refs/pull/*/head` for
+every PR ever opened, those refs cannot be deleted short of deleting the
+repository, and they still reached history from before the enterprise
+configuration moved out. The private repository was renamed
+`reactorynet/reactory-workspace-archive` and stays private; a new
+`reactorynet/reactory-workspace` was created with `master` alone (the same
+commit the archive's `master` had, 15 commits, no PR refs), checked for
+enterprise names, profiles, lock files and secrets, and then made public.
+Clone URLs are unchanged. `harden --repo reactory-workspace` then applied the
+settings, scanning, Dependabot, Actions and branch-protection controls; on a
+branch with no protection yet, the first run creates the protection without
+the signed-commit requirement (that is a separate endpoint and the audit only
+reports it once protection exists), so a second `harden` run added it.
+Re-audit: 36/39, the three public-only workflow files being the open
+`security/baseline-*` PR (auto-merge armed, squash). The same day `pull` was
+added to the CLI: fast-forward only, uncommitted changes stashed around the
+update.
+
 ### 3.2 The control chain the policy creates
 
 ```mermaid
