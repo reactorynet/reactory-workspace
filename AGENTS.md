@@ -77,6 +77,7 @@ Everything that writes to GitHub or to a checkout has a dry run: `-n`.
 | Task | Command |
 |---|---|
 | Fresh machine | `enterprise add <git-url>`, `clone --group platform`, `remotes` |
+| Bring local checkouts up to date | `pull -n`, then `pull` (fast-forward only; uncommitted changes are stashed and restored) |
 | Feature branch to the mirror with a PR | `push --to <org> --repo <r> -u --pr` |
 | Bring the mirror level with upstream | `sync --to <org> -n`, then `sync --to <org> --pr` |
 | Bring upstream level with the mirror | `sync --to reactorynet -n`, then `--pr` |

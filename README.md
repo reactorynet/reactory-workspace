@@ -70,11 +70,38 @@ bin/reactory-repos check                      # remotes, relative .gitmodules, g
 bin/reactory-repos remotes                    # (re)create remotes in every present repo
 bin/reactory-repos fetch                      # all orgs, all repos, in parallel
 bin/reactory-repos status --fetch             # branch, dirty?, upstream<>mirror divergence, local vs origin
+bin/reactory-repos pull -n                    # what a fast-forward of every checked-out branch would do
+bin/reactory-repos pull                       # ... and do it, stashing uncommitted changes around the update
 bin/reactory-repos exec -- git log --oneline -3
 ```
 
 Limit any command with `--group platform|tenants|optional|native` or
 `--repo <name>` (repeatable).
+
+### Bringing local checkouts up to date
+
+`pull` fetches the remote each checked-out branch follows (including
+`origin`, which `status --fetch` leaves alone) and fast-forwards the branch.
+It never merges or rebases:
+
+- **Uncommitted changes** to tracked files are stashed, the branch is
+  fast-forwarded, and the stash is popped again, with staged changes kept
+  staged. If a file changed both locally and upstream, the dry run says so.
+  If restoring the stash conflicts, the conflict is left in the working tree
+  and the stash is kept (`reactory-repos pull <time>` in `git stash list`).
+  `--no-stash` skips dirty repos instead.
+- **Untracked files** are left where they are. Git refuses a fast-forward
+  that would overwrite one; the dry run lists them and nothing is changed.
+  Stashing untracked files in a parent repo would also sweep up the nested
+  module checkouts.
+- **Diverged branches** (local commits not upstream) are reported and
+  skipped.
+- **Detached submodules** are skipped: the parent decides their commit.
+- **A submodule on a branch, sitting at the commit its parent pins,** is not
+  moved past the pin, because the parent would then show a modified
+  submodule. Bump the pin in the parent with a PR, or pass `--move-pinned`.
+- **`--from <org>`** fast-forwards default branches to that org's default
+  branch instead of each branch's upstream. Feature branches are skipped.
 
 ### Fresh machine
 

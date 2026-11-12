@@ -586,6 +586,152 @@ def cmd_exec(ws: Workspace, a) -> int:
     return rc
 
 
+# ----------------------------------------------------------------------------
+# pull: fast-forward the checked-out branches, stashing uncommitted work around it
+# ----------------------------------------------------------------------------
+def pull_source(ws: Workspace, r: Repo, branch: str, from_org: Optional[str]) -> Tuple[Optional[str], Optional[str], str]:
+    """(ref, remote, why-not): what the current branch fast-forwards to. With --from it is that org's
+    default branch, and only when the checked-out branch is one of the repo's default branches;
+    otherwise it is the branch's configured upstream."""
+    if from_org:
+        org = ws.orgs[from_org]
+        if not r.in_org(from_org):
+            return None, None, f"not in {org.github_org}"
+        if branch not in {r.branch_in(k) for k in ws.orgs if r.in_org(k)}:
+            return None, None, f"on {branch}, not a default branch; --from only moves default branches"
+        return f"{org.remote}/{r.branch_in(from_org)}", org.remote, ""
+    remote = git(r.path, "config", f"branch.{branch}.remote", check=False).stdout.strip()
+    merge = git(r.path, "config", f"branch.{branch}.merge", check=False).stdout.strip()
+    if not remote or not merge:
+        return None, None, f"{branch} has no upstream (git branch -u <remote>/<branch>, or --from <org>)"
+    if remote == ".":
+        return merge.replace("refs/heads/", "", 1), None, ""
+    return f"{remote}/{merge.replace('refs/heads/', '', 1)}", remote, ""
+
+
+def parent_pin(ws: Workspace, r: Repo) -> Optional[Tuple[Repo, str]]:
+    """The commit a submodule's parent records for it at the parent's HEAD."""
+    if r.kind != "submodule" or not r.parent:
+        return None
+    parent = next((p for p in ws.repos if p.name == r.parent), None)
+    if parent is None or not parent.exists:
+        return None
+    rel = os.path.relpath(r.path, parent.path)
+    parts = git_out(parent.path, "ls-tree", "HEAD", "--", rel).split()
+    return (parent, parts[2]) if len(parts) >= 3 and parts[1] == "commit" else None
+
+
+def stashable_changes(repo_dir: Path) -> List[str]:
+    """Tracked files with uncommitted (staged or unstaged) changes. Untracked files stay where they
+    are: a fast-forward that would overwrite one is refused by git, and stashing untracked content
+    in a parent repo would sweep up nested module checkouts."""
+    out = git(repo_dir, "status", "--porcelain", "-z", "--untracked-files=no", "--ignore-submodules=all").stdout
+    entries, paths = out.split("\0"), []
+    i = 0
+    while i < len(entries):
+        e = entries[i]
+        if len(e) > 3:
+            paths.append(e[3:])
+            if e[0] in "RC":        # rename/copy: the next entry is the original path
+                i += 1
+        i += 1
+    return paths
+
+
+def restore_stash(r: Repo, label: str) -> Tuple[bool, str]:
+    """Pop the stash made by pull, keeping staged changes staged when possible."""
+    cp = git(r.path, "stash", "pop", "--index", "--quiet", check=False)
+    if cp.returncode == 0:
+        return True, ""
+    if git_out(r.path, "diff", "--name-only", "--diff-filter=U"):
+        return False, f"conflicts restoring the stash; resolve them, the stash is kept ({label})"
+    cp = git(r.path, "stash", "pop", "--quiet", check=False)   # index could not be restored as it was
+    if cp.returncode == 0:
+        return True, "staged changes restored as unstaged"
+    return False, f"could not restore the stash ({last_line(cp.stderr)}); it is kept ({label})"
+
+
+def cmd_pull(ws: Workspace, a) -> int:
+    repos = ws.ordered_for_clone(ws.select(a.repo, a.group, include_missing=False))   # parents before submodules
+    plans: List[Tuple[Repo, str, Optional[str], Optional[str], str]] = []
+    for r in repos:
+        branch = git_out(r.path, "branch", "--show-current")
+        if not branch:
+            plans.append((r, "", None, None, "detached HEAD (pinned by its parent: pull the parent, then git submodule update)"))
+            continue
+        ref, remote, why = pull_source(ws, r, branch, a.from_org)
+        plans.append((r, branch, ref, remote, why))
+    # fetch exactly the remote each branch follows (status --fetch does not fetch origin)
+    to_fetch = [(r, remote) for r, _, ref, remote, _ in plans if ref and remote]
+    fetched: Dict[str, str] = {}
+    with cf.ThreadPoolExecutor(max_workers=a.jobs) as ex:
+        for repo, res in ex.map(lambda t: fetch_one(t[0], [t[1]], prune=False), to_fetch):
+            fetched[repo.name] = next(iter(res.values()), "ok")
+    stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rc = 0
+    for r, branch, ref, remote, why in plans:
+        name = pad(r.name, 38)
+        if ref is None:
+            print(f"{dim('skip   ')} {name} {why}"); continue
+        if remote and fetched.get(r.name, "ok") != "ok":
+            print(f"{warn('skip   ')} {name} fetch {remote}: {fetched[r.name]}"); rc = 1; continue
+        if not ref_exists(r.path, ref):
+            print(f"{warn('skip   ')} {name} {ref} not found"); continue
+        ab = ahead_behind(r.path, "HEAD", ref)
+        if ab is None:
+            print(f"{err('failed ')} {name} cannot compare {branch} with {ref}"); rc = 1; continue
+        ahead, behind = ab
+        if behind == 0:
+            print(f"{dim('ok     ')} {name} {branch} up to date with {ref}" + (f" (ahead {ahead})" if ahead else "")); continue
+        if ahead:
+            print(f"{warn('skip   ')} {name} {branch} has diverged from {ref} (ahead {ahead}, behind {behind}); "
+                  f"pull only fast-forwards: merge or rebase by hand"); continue
+        head, target = git_out(r.path, "rev-parse", "HEAD"), git_out(r.path, "rev-parse", ref)
+        pin = parent_pin(ws, r)
+        if pin and head == pin[1] and target != pin[1] and not a.move_pinned:
+            print(f"{warn('skip   ')} {name} {pin[0].name} pins it at {head[:7]} ({behind} behind {ref}); moving it would leave "
+                  f"{pin[0].name} with a modified submodule. Bump the pin in {pin[0].name} with a PR, or --move-pinned")
+            continue
+        changed = stashable_changes(r.path)
+        if changed and a.no_stash:
+            print(f"{warn('skip   ')} {name} {len(changed)} uncommitted change(s) and --no-stash"); continue
+        incoming = set(git_out(r.path, "diff", "--name-only", head, target).splitlines())
+        overlap = sorted(incoming & set(changed))
+        move = f"{branch} {head[:7]}..{target[:7]} (+{behind} from {ref})"
+        stash_note = f", stash {len(changed)} changed file(s) around it" if changed else ""
+        overlap_note = f"; also changed upstream, may conflict on restore: {', '.join(overlap)}" if overlap else ""
+        if a.dry_run:
+            untracked = git(r.path, "ls-files", "--others", "--exclude-standard", "--", *sorted(incoming), check=False).stdout.split()
+            blocked = f"; untracked file(s) in the way, git will refuse: {', '.join(untracked)}" if untracked else ""
+            notes = overlap_note + blocked
+            print(f"{ok('would  ')} {name} fast-forward {move}{stash_note}{warn(notes) if notes else ''}")
+            continue
+        label = ""
+        if changed:
+            msg = f"reactory-repos pull {stamp}"
+            cp = git(r.path, "stash", "push", "--quiet", "-m", msg, check=False)
+            if cp.returncode != 0:
+                print(f"{err('failed ')} {name} git stash: {last_line(cp.stderr)}"); rc = 1; continue
+            label = f"stash@{{0}}: {msg}"
+        cp = git(r.path, "merge", "--ff-only", "--quiet", ref, check=False)
+        if cp.returncode != 0:
+            why = " ".join(ln.strip() for ln in cp.stderr.splitlines() if ln.strip() and ln.strip() != "Aborting")
+            print(f"{err('failed ')} {name} {why or last_line(cp.stderr)}"); rc = 1
+            if label:
+                good, note = restore_stash(r, label)
+                print("         " + (dim("uncommitted changes restored") if good else err(note)))
+            continue
+        line = f"{ok('ff     ')} {name} {move}"
+        if label:
+            good, note = restore_stash(r, label)
+            if good:
+                line += dim(f"; {len(changed)} uncommitted change(s) stashed and restored" + (f" ({note})" if note else ""))
+            else:
+                line += "; " + err(note); rc = 1
+        print(line)
+    return rc
+
+
 def cmd_push(ws: Workspace, a) -> int:
     target = ws.org(a.to)
     rc = 0
@@ -1837,6 +1983,11 @@ def build_parser(org_keys: List[str], ws_groups: List[str]) -> argparse.Argument
     s.add_argument("--fetch", action="store_true"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser("exec", help="run a command in every selected repo: exec -- git log -1"); common(s)
     s.add_argument("command", nargs=argparse.REMAINDER); s.set_defaults(fn=cmd_exec)
+    s = sub.add_parser("pull", help="fast-forward the checked-out branch of every selected repo, stashing uncommitted changes around it"); common(s)
+    s.add_argument("--from", dest="from_org", choices=org_keys, help="fast-forward default branches to this org's default branch instead of each branch's upstream")
+    s.add_argument("--no-stash", action="store_true", help="skip repos with uncommitted changes instead of stashing them")
+    s.add_argument("--move-pinned", action="store_true", help="also move a submodule that sits at the commit its parent pins")
+    s.add_argument("-j", "--jobs", type=int, default=8); s.add_argument("-n", "--dry-run", action="store_true"); s.set_defaults(fn=cmd_pull)
     s = sub.add_parser("push", help="push the current branch of selected repos to ONE org"); common(s); to_arg(s)
     s.add_argument("--branch"); s.add_argument("-u", "--set-upstream", action="store_true")
     s.add_argument("--force-protected", action="store_true", help="allow pushing to a protected default branch")
