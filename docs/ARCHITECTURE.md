@@ -9,7 +9,7 @@ enterprise. Diagrams are Mermaid and render on GitHub.
 ```mermaid
 flowchart LR
     subgraph ent["enterprises/&lt;name&gt;/ (gitignored: one nested git repo per enterprise)"]
-        PROF["profile.json<br/>• mirror org(s) + protection<br/>• include_groups / exclude_repos<br/>• org_specific_paths<br/>• extra_repos (enterprise-native)<br/>• provisioning template + vars"]
+        PROF["profile.json<br/>• mirror org(s) + protection<br/>• include_groups / include_repos / exclude_repos<br/>• org_specific_paths<br/>• extra_repos (enterprise-native)<br/>• provisioning template + vars"]
         TPL["templates/*.yaml<br/>repo-definition template"]
         LOCK["lock.json<br/>pinned SHA per repo"]
         FRAG["rbac/*.fragment<br/>rendered definitions"]
@@ -25,7 +25,7 @@ flowchart LR
     TPLE -->|enterprise init| PROF
 
     subgraph runtime["bin/reactory-repos (stdlib Python)"]
-        WS["Workspace model<br/>orgs = upstream + profile.orgs<br/>repos = inventory ∩ include_groups<br/>        + extra_repos"]
+        WS["Workspace model<br/>orgs = upstream + profile.orgs<br/>repos = inventory ∩ (include_groups ∪ include_repos)<br/>        + extra_repos"]
         CMD["commands<br/>enterprise · list · clone · remotes · fetch · status<br/>push · sync · bootstrap · init<br/>lock · checkout-lock · check · provision<br/>audit · harden · seed · cleanup"]
     end
 
@@ -45,8 +45,11 @@ flowchart LR
 Rules the model applies:
 
 - An inventory repo is **mirrored** into every org of the active profile when
-  one of its `groups` is in `include_groups` and it is not in `exclude_repos`.
-  Otherwise it is upstream-only (the reactorynet tenant configs, for example).
+  one of its `groups` is in `include_groups`, or its name is in
+  `include_repos`, and it is not in `exclude_repos`. Otherwise it is
+  upstream-only (the reactorynet tenant configs, for example). `include_repos`
+  takes a single repo from a group that is not mirrored as a whole; a name
+  missing from the inventory in either list is an error.
 - A profile's `extra_repos` are **enterprise-native**: they exist only in the
   named org. `no_repo: true` marks a folder that has no remote anywhere yet.
 - Per-repo `orgs` and `branches` maps remain available for exceptions
@@ -204,7 +207,8 @@ sequenceDiagram
 3. List the files that org injects into repositories under
    `org_specific_paths`. Anything the enterprise's repo-management system
    writes into repos belongs here, plus `CODEOWNERS`.
-4. Choose `include_groups` (normally `["platform"]`) and any `exclude_repos`.
+4. Choose `include_groups` (normally `["platform"]`), any single repos from
+   other groups under `include_repos`, and any `exclude_repos`.
 5. Add the enterprise's own modules and tenant configs under `extra_repos`.
 6. Point `provisioning.template` at a template for the enterprise's repo
    system (adapt `templates/provisioning.yaml` in the enterprise repo;

@@ -249,10 +249,16 @@ class Workspace:
             sys.exit(err(f"primary org '{self.primary_key}' is not defined (known: {', '.join(self.orgs)})"))
 
         include_groups = set(self.profile.get("include_groups", []))
-        exclude_repos = set(self.profile.get("exclude_repos", []))
+        include_repos = set(self.profile.get("include_repos", []))   # single repos from groups not mirrored as a whole
+        exclude_repos = set(self.profile.get("exclude_repos", []))   # wins over both includes
+        unknown = sorted((include_repos | exclude_repos) - {d["name"] for d in inv["repos"]})
+        if unknown:
+            sys.exit(err(f"profile '{self.profile_name}': include_repos / exclude_repos name repos not in the inventory: "
+                         f"{', '.join(unknown)}"))
         self.repos: List[Repo] = []
         for data in inv["repos"]:
-            mirrored = bool(include_groups & set(data.get("groups", []))) and data["name"] not in exclude_repos
+            mirrored = (bool(include_groups & set(data.get("groups", []))) or data["name"] in include_repos) \
+                and data["name"] not in exclude_repos
             self.repos.append(Repo(data, self.orgs, self.root, self.upstream_key, self.mirror_keys if mirrored else []))
         for data in self.profile.get("extra_repos", []):
             org = data.get("org") or (self.mirror_keys[0] if self.mirror_keys else None)
