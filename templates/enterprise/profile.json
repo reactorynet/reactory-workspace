@@ -9,6 +9,8 @@
 
   "// include_groups": "Inventory groups (repos.json) that are mirrored into this enterprise. Everything else is treated as upstream-only.",
   "include_groups": ["platform"],
+  "// include_repos": "Single inventory repos mirrored although their group is not (a service the platform calls, say). `exclude_repos` wins over both includes. Names must exist in repos.json.",
+  "include_repos": [],
   "exclude_repos": [],
 
   "orgs": {

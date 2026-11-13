@@ -368,7 +368,8 @@
       "groups": [
         "optional"
       ],
-      "description": "Standalone speech service"
+      "description": "Standalone speech service",
+      "has_dockerfile": true
     },
     {
       "name": "reactor-system-navigator",

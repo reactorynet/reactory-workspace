@@ -23,7 +23,7 @@ Reactory server keeps modules under `src/modules/`.
 | Path | Purpose |
 |---|---|
 | `repos.json` | **Platform inventory**: every git repository in a checkout (path, kind root / submodule / nested, parent, groups) and the upstream org. Enterprise-neutral. |
-| `enterprises/<name>/` | **Enterprise configuration repos**, gitignored, one git repo each: `profile.json` (mirror org(s), protection, org-owned paths, mirrored groups, enterprise-native repos, provisioning), `lock.json`, provisioning templates, rendered fragments, docs. `enterprise add <git-url>` clones one; `enterprise init <name>` creates one from `templates/enterprise/`. |
+| `enterprises/<name>/` | **Enterprise configuration repos**, gitignored, one git repo each: `profile.json` (mirror org(s), protection, org-owned paths, mirrored groups and single repos, enterprise-native repos, provisioning), `lock.json`, provisioning templates, rendered fragments, docs. `enterprise add <git-url>` clones one; `enterprise init <name>` creates one from `templates/enterprise/`. |
 | `policies/<name>.json` | **GitHub security policy** for an org: org settings, repo settings, branch protection, Actions permissions, baseline files. `public-upstream.json` is applied to reactorynet by `audit` / `harden` / `seed`. |
 | `templates/enterprise/` | Skeleton of an enterprise configuration repo: commented `profile.json`, example provisioning template, README. |
 | `templates/upstream/` | Baseline files `seed` adds to upstream repos: `SECURITY.md`, `CODEOWNERS`, `dependabot.yml`, CodeQL, dependency review, Scorecard (SHA-pinned). |
