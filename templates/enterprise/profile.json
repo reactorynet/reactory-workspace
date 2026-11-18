@@ -32,6 +32,8 @@
         ".github/workflows/ci.yaml",
         "catalog-info.yaml"
       ],
+      "// base_images": "Optional. Public base image -> your org's copy, for a Dockerfile policy that only admits your registry. On every sync and grafted import the tool rewrites matching FROM images and ARG defaults in Dockerfiles to your copy, and back to the public image toward upstream. Keys match the text exactly (a templated FROM such as node:${NODE_VERSION} works as a key). Images with no entry are listed in the sync PR. Your org's CI must be able to pull the copies.",
+      "base_images": {},
       "// provisioning": "Optional. `provision --to acme` renders one template per mirrored repo into fragments for your repo-management system.",
       "provisioning": {
         "system": "terraform-github",
