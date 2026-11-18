@@ -150,6 +150,15 @@ using a **merge commit**, never squash or rebase: the two histories must keep
 a common ancestor. Squash is allowed on the repos for ordinary feature PRs, so
 the sync PR body says which method to use if someone merges it by hand.
 
+An org whose Dockerfile policy only admits its own registry lists
+`base_images` in its profile (public image → its copy). `sync` and the
+grafted import rewrite matching `FROM` images and `ARG` defaults in every
+Dockerfile to the target's copy, and back to the public image toward
+upstream, so the upstream Dockerfile stays the single source. A Dockerfile
+conflict that exists only because the two orgs name the images differently
+is merged again from the translated versions; images with no entry are
+listed in the sync PR. The org's CI then has to be able to pull the copies.
+
 ### First import into a newly created org repo
 
 ```bash

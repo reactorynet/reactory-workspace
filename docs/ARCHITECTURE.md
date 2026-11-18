@@ -9,7 +9,7 @@ enterprise. Diagrams are Mermaid and render on GitHub.
 ```mermaid
 flowchart LR
     subgraph ent["enterprises/&lt;name&gt;/ (gitignored: one nested git repo per enterprise)"]
-        PROF["profile.json<br/>• mirror org(s) + protection<br/>• include_groups / include_repos / exclude_repos<br/>• org_specific_paths<br/>• extra_repos (enterprise-native)<br/>• provisioning template + vars"]
+        PROF["profile.json<br/>• mirror org(s) + protection<br/>• include_groups / include_repos / exclude_repos<br/>• org_specific_paths<br/>• base_images (Dockerfile registry)<br/>• extra_repos (enterprise-native)<br/>• provisioning template + vars"]
         TPL["templates/*.yaml<br/>repo-definition template"]
         LOCK["lock.json<br/>pinned SHA per repo"]
         FRAG["rbac/*.fragment<br/>rendered definitions"]
@@ -135,7 +135,8 @@ flowchart TD
     D -->|no| W["git worktree add --detach tmp T/branch<br/>checkout -b sync/S-to-T-&lt;stamp&gt;"]
     W --> M["git merge --no-ff --no-commit S/branch"]
     M --> P["org-specific paths:<br/>T-owned: T has file → checkout from T, else git rm<br/>S-owned: never enters T"]
-    P --> K{"conflicts left?"}
+    P --> I["base images (Dockerfiles):<br/>S's copies → public → T's copies<br/>image-only conflicts re-merged translated"]
+    I --> K{"conflicts left?"}
     K -->|yes| X["abort (or keep worktree with --keep-worktree)"]
     K -->|no| CM["commit merge"]
     CM --> Q{"T protected or --pr?"}
@@ -168,6 +169,22 @@ in the target means removed). When it is the **source**, its paths never cross
 into the target. So the enterprise keeps its CODEOWNERS and injected workflows and never
 sends them upstream; the upstream keeps its seeded CodeQL, Dependabot and
 `SECURITY.md` and never sends them into the mirror.
+
+Dockerfiles are shared, not org-specific, but an enterprise's Dockerfile
+policy may only admit base images from its own registry. Its profile then
+lists `base_images` (public image → its copy), and the merge worktree
+rewrites them: the source org's copies back to the public images, then the
+public images to the target org's copies. Only `FROM` images and `ARG`
+defaults that match a key exactly are touched, so the enterprise's
+Dockerfile differs from upstream in those references and nothing else.
+After the first rewrite, an upstream image bump conflicts with the
+rewritten line; the tool merges that file again from its three versions
+translated for the target, which settles it unless the enterprise also
+changed the file. Commit messages and PR bodies name only the target's
+images, so a sync toward upstream never carries the enterprise registry into
+public history. Images with no entry are listed in the sync PR. The rewrite
+runs only when there is something to merge; a mirror already level with
+upstream keeps its public images until the next upstream change.
 
 ## 5. First import into a new org repo
 

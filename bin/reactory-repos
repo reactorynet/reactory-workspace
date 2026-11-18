@@ -119,6 +119,14 @@ class Org:
         self.default_branch: str = data.get("default_branch", "main")
         self.protected: bool = bool(data.get("protected_default_branch", role == "mirror"))
         self.org_specific_paths: List[str] = list(data.get("org_specific_paths", []))
+        # Public base image -> this org's copy of it (e.g. a private registry its Dockerfile policy requires).
+        # `sync` and the grafted import rewrite matching `FROM` images and `ARG` defaults in Dockerfiles: into
+        # this org's copy when the org is the target, back to the public image when it is the source.
+        self.base_images: Dict[str, str] = dict(data.get("base_images", {}))
+        dup = sorted({v for v in self.base_images.values() if list(self.base_images.values()).count(v) > 1})
+        if dup:
+            sys.exit(err(f"org '{key}': base_images maps several public images to {', '.join(dup)}; "
+                         f"the reverse rewrite would be ambiguous"))
         self.pr_title_prefix: str = data.get("pr_title_prefix", "")
         self.merge_strategy: str = data.get("merge_strategy", "merge-commit")
         # How PRs the tool opens are merged. Sync / import PRs use `merge_strategy` (a merge commit keeps the
@@ -810,6 +818,126 @@ def org_paths_for(src: Org, tgt: Org) -> Tuple[List[str], List[str]]:
     return list(tgt.org_specific_paths), list(src.org_specific_paths)
 
 
+# Base images. An org whose Dockerfile policy only admits its own registry lists `base_images` (public
+# image -> its copy). The upstream Dockerfile stays the single source; the org's copy of it differs only in
+# those image references, rewritten on every sync and grafted import in both directions.
+DOCKERFILE_NAME = re.compile(r"(^|/)(Dockerfile([.-][^/]*)?|[^/]+\.[Dd]ockerfile)$")
+FROM_LINE = re.compile(r"^(\s*FROM\s+)((?:--\S+\s+)*)(\S+)(.*)$", re.IGNORECASE)
+ARG_LINE = re.compile(r"^(\s*ARG\s+)([A-Za-z_][A-Za-z0-9_]*)=([\"']?)([^\"'\s]+)\3(\s*(?:#.*)?)$", re.IGNORECASE)
+
+
+def rewrite_images(text: str, mapping: Dict[str, str]) -> Tuple[str, List[str]]:
+    """Replace `FROM` images and `ARG` defaults that exactly match a key of `mapping`; returns the new
+    text and the replacement images in order."""
+    if not mapping:
+        return text, []
+    out, used = [], []
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        eol = line[len(body):]
+        m = FROM_LINE.match(body)
+        if m and m.group(3) in mapping:
+            body = m.group(1) + m.group(2) + mapping[m.group(3)] + m.group(4)
+            used.append(mapping[m.group(3)])
+        else:
+            m = ARG_LINE.match(body)
+            if m and m.group(4) in mapping:
+                q = m.group(3)
+                body = m.group(1) + m.group(2) + "=" + q + mapping[m.group(4)] + q + m.group(5)
+                used.append(mapping[m.group(4)])
+        out.append(body + eol)
+    return "".join(out), used
+
+
+def translate_images(text: str, src: Optional[Org], tgt: Org) -> Tuple[str, List[str]]:
+    """The source org's copies back to the public images, then the public images to the target's copies."""
+    text, back = rewrite_images(text, {v: k for k, v in src.base_images.items()} if src else {})
+    text, fwd = rewrite_images(text, tgt.base_images)
+    return text, [x for x in back if x not in tgt.base_images] + fwd
+
+
+def unmapped_images(text: str, tgt: Org) -> List[str]:
+    """Base images (global ARG defaults resolved, stage aliases and `scratch` skipped) that are neither one
+    of the target's copies nor in a registry those copies live in."""
+    if not tgt.base_images:
+        return []
+    registries = {v.split("/", 1)[0] for v in tgt.base_images.values() if "/" in v}
+    args: Dict[str, str] = {}
+    stages, seen_from, found = set(), False, []
+    for line in text.splitlines():
+        a = ARG_LINE.match(line)
+        if a and not seen_from:
+            args[a.group(2)] = a.group(4)
+        m = FROM_LINE.match(line)
+        if not m:
+            continue
+        seen_from = True
+        img = re.sub(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", lambda x: args.get(x.group(1), x.group(0)), m.group(3))
+        alias = re.search(r"\bAS\s+(\S+)", m.group(4), re.IGNORECASE)
+        if alias:
+            stages.add(alias.group(1).lower())
+        if img.lower() in stages or img == "scratch" or img in tgt.base_images.values():
+            continue
+        if img.split("/", 1)[0] in registries:
+            continue
+        found.append(img)
+    return found
+
+
+def apply_base_images(wt: Path, src: Optional[Org], tgt: Org, src_ref: str, tgt_ref: str) -> Tuple[List[str], List[str]]:
+    """Rewrite the base images of every Dockerfile in a merge worktree for the target org. A Dockerfile
+    left conflicted by the merge is merged again from its three versions translated for the target, which
+    settles conflicts that exist only because the two orgs name the base images differently; a conflict
+    that remains after that is left for a person.
+    Returns (actions, unmapped images). Actions name only the target's images, so a sync toward the
+    public upstream never carries the enterprise's registry into its history."""
+    if not ((src and src.base_images) or tgt.base_images):
+        return [], []
+    owned = set(tgt.org_specific_paths) | set(src.org_specific_paths if src else [])
+    conflicted = set(git_out(wt, "diff", "--name-only", "--diff-filter=U").splitlines())
+    base = git(wt, "merge-base", src_ref, tgt_ref, check=False).stdout.strip()
+
+    def show(ref: str, path: str) -> Optional[str]:
+        cp = git(wt, "show", f"{ref}:{path}", check=False)
+        return cp.stdout if cp.returncode == 0 else None
+
+    actions, unmapped = [], []
+    for path in sorted(set(git_out(wt, "ls-files").splitlines())):
+        if not DOCKERFILE_NAME.search(path) or path in owned:
+            continue
+        if path in conflicted:
+            versions = [show(tgt_ref, path), show(base, path) if base else None, show(src_ref, path)]
+            if None in versions:
+                continue
+            tmp = Path(tempfile.mkdtemp(prefix="reactory-images-"))
+            try:
+                files = []
+                for name, content in zip(("ours", "base", "theirs"), versions):
+                    (tmp / name).write_text(translate_images(content, src, tgt)[0], encoding="utf-8")
+                    files.append(str(tmp / name))
+                cp = run(["git", "merge-file", "-p", *files], check=False)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            if cp.returncode != 0:
+                continue   # conflicts beyond the base images: left for a person
+            text = cp.stdout
+        else:
+            fp = wt / path
+            if not fp.is_file():
+                continue
+            text = fp.read_text(encoding="utf-8")
+        new, used = translate_images(text, src, tgt)
+        if path in conflicted or new != text:
+            (wt / path).write_text(new, encoding="utf-8")
+            git(wt, "add", "--", path)
+            if path in conflicted:
+                actions.append(f"{path}: conflict from differing base image names, merged with them translated")
+            else:
+                actions.append(f"base image(s) in {path}: {', '.join(dict.fromkeys(used))}")
+        unmapped += [f"{img} ({path})" for img in unmapped_images(new, tgt)]
+    return actions, unmapped
+
+
 def sync_repo(ws: Workspace, r: Repo, src: Org, tgt: Org, do_push: bool, do_pr: bool,
               keep_worktree: bool, dry_run: bool, auto_merge: bool = True) -> str:
     if not (r.in_org(src.key) and r.in_org(tgt.key)):
@@ -840,6 +968,8 @@ def sync_repo(ws: Workspace, r: Repo, src: Org, tgt: Org, do_push: bool, do_pr: 
         msg = f"Sync {src.github_org}/{r.repo_name_in(src.key)}@{r.branch_in(src.key)} into {tgt.github_org}@{r.branch_in(tgt.key)}"
         git(wt_dir, "merge", "--no-ff", "--no-commit", "--no-edit", src_ref, check=False)
         actions = apply_org_specific_paths(wt_dir, tgt_ref, *org_paths_for(src, tgt))
+        img_actions, unmapped = apply_base_images(wt_dir, src, tgt, src_ref, tgt_ref)
+        actions += img_actions
         conflicts = git_out(wt_dir, "diff", "--name-only", "--diff-filter=U").splitlines()
         if conflicts:
             if keep_worktree:
@@ -851,6 +981,8 @@ def sync_repo(ws: Workspace, r: Repo, src: Org, tgt: Org, do_push: bool, do_pr: 
         git(wt_dir, "commit", "-q", "--no-verify", "-m", msg + ("\n\n" + "\n".join(actions) if actions else ""))
         sha = git_out(wt_dir, "rev-parse", "--short", "HEAD")
         result = f"merged {src_ref} (+{ab[0]}) -> {sync_branch} @ {sha}" + (f" [{len(actions)} org path(s)]" if actions else "")
+        if unmapped:
+            result += "; " + warn(f"no base_images entry for {', '.join(unmapped)}")
         if not (do_push or do_pr):
             return result + " (local only; use --push / --pr)"
         if tgt.protected or do_pr:
@@ -866,6 +998,10 @@ def sync_repo(ws: Workspace, r: Repo, src: Org, tgt: Org, do_push: bool, do_pr: 
                         f"**Merge with a merge commit (not squash / rebase)** so the two histories keep a common ancestor.\n")
                 if actions:
                     body += "\nOrg-specific paths handled:\n" + "\n".join(f"- {x}" for x in actions)
+                if unmapped:
+                    body += (f"\n\nBase images with no `base_images` entry for {tgt.github_org} (a Dockerfile policy "
+                             f"that only admits {tgt.github_org}'s registry rejects them):\n"
+                             + "\n".join(f"- `{x}`" for x in unmapped))
                 body += pr_body_footer(tgt.sync_merge_method)
                 good, url, note = gh_pr_create(tgt, r, sync_branch, title, body)
                 result += "; " + (ok("PR: " + url) + (f" ({note})" if note else "") if good else err("gh pr create failed: " + note))
@@ -924,6 +1060,8 @@ def graft_import_branch(r: Repo, src: Optional[Org], tgt: Org, src_ref: str, tgt
             else:
                 git(wt_dir, "rm", "-q", "--force", "--", path, check=False)
                 actions.append(f"drop {path} (absent in {src_ref})")
+        img_actions, unmapped = apply_base_images(wt_dir, src, tgt, src_sha, tgt_ref)
+        actions += img_actions + [f"no base_images entry for {x}" for x in unmapped]
         src_desc = f"{src.github_org}/{r.repo_name_in(src.key)}@{r.branch_in(src.key)}" if src else f"local {src_ref}"
         msg = (f"Import {src_desc} onto the auto-initialised {tgt.github_org}/{r.repo_name_in(tgt.key)}"
                f"@{r.branch_in(tgt.key)}")
