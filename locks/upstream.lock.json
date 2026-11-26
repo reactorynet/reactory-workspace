@@ -1,0 +1,84 @@
+{
+  "profile": null,
+  "primary_org": "reactorynet",
+  "generated": "2026-11-26T14:39:19+00:00",
+  "repos": {
+    "reactory-express-server": {
+      "path": "reactory-express-server",
+      "sha": "e73b95f480e3bcc24720260ebdbbb47a0df9077b",
+      "branch": "master",
+      "origin": "git@github.com:reactorynet/reactory-express-server.git",
+      "dirty": false
+    },
+    "reactory-pwa-client": {
+      "path": "reactory-pwa-client",
+      "sha": "7a8de43709ea80d1c5e2b72f535a6ed352872e30",
+      "branch": "master",
+      "origin": "git@github.com:reactorynet/reactory-pwa-client.git",
+      "dirty": false
+    },
+    "reactory-client-core-pwa-plugin": {
+      "path": "reactory-pwa-client/src/components/plugins/reactory-core",
+      "sha": "5b13795bdde8fccf7b262d291ec60d425bd6644a",
+      "branch": "master",
+      "origin": "git@github.com:reactorynet/reactory-client-core-pwa-plugin.git",
+      "dirty": false
+    },
+    "reactory-communicator-pwa-plugin": {
+      "path": "reactory-pwa-client/src/components/plugins/reactory-communicator",
+      "sha": "b32d6bf4e3b146b2247fdd9d53c48269b947f324",
+      "branch": "main",
+      "origin": "git@github.com:reactorynet/reactory-communicator-pwa-plugin.git",
+      "dirty": false
+    },
+    "reactory-telemetry-pwa-plugin": {
+      "path": "reactory-pwa-client/src/components/plugins/reactory-telemetry",
+      "sha": "94fa4ba8f7d28fb4ccc7140c26d310f2253148df",
+      "branch": "master",
+      "origin": "git@github.com:reactorynet/reactory-telemetry-pwa-plugin.git",
+      "dirty": false
+    },
+    "reactory-core": {
+      "path": "reactory-core",
+      "sha": "609e181dee8b19881423136d76408e586c175f8b",
+      "branch": "master",
+      "origin": "git@github.com:reactorynet/reactory-core.git",
+      "dirty": false
+    },
+    "reactory-data": {
+      "path": "reactory-data",
+      "sha": "cd94d3f2e97033e75d1436f45ecc47c939555b0f",
+      "branch": "master",
+      "origin": "git@github.com:reactorynet/reactory-data.git",
+      "dirty": false
+    },
+    "reactory-client-core-plugin": {
+      "path": "reactory-data/plugins/reactory-client-core",
+      "sha": "b558eb8158b64731afa182cd7b01677235d7b099",
+      "branch": "master",
+      "origin": "git@github.com:reactorynet/reactory-client-core-plugin.git",
+      "dirty": false
+    },
+    "reactory-reactor": {
+      "path": "reactory-express-server/src/modules/reactory-reactor",
+      "sha": "2d56d1e8dd8de14dbb9e7bca3152b8d08a6d0c82",
+      "branch": "master",
+      "origin": "git@github.com:reactorynet/reactory-reactor.git",
+      "dirty": false
+    },
+    "reactory-classroom": {
+      "path": "reactory-express-server/src/modules/reactory-classroom",
+      "sha": "ee0e007123f9f2fedad02717197ae6bc2e1506a2",
+      "branch": "master",
+      "origin": "git@github.com:reactorynet/reactory-classroom.git",
+      "dirty": false
+    },
+    "reactory-socialeyes": {
+      "path": "reactory-express-server/src/modules/reactory-socialeyes",
+      "sha": "2eae98209506cd9da7b1ce1c64559db3bb8f7143",
+      "branch": "master",
+      "origin": "git@github.com:reactorynet/reactory-socialeyes.git",
+      "dirty": false
+    }
+  }
+}
