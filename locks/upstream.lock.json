@@ -1,0 +1,84 @@
+{
+  "profile": null,
+  "primary_org": "reactorynet",
+  "generated": "2026-11-26T08:25:44+00:00",
+  "repos": {
+    "reactory-express-server": {
+      "path": "reactory-express-server",
+      "sha": "d1a569f0b98f9d9e3813a61eacc17c3b5b3923d9",
+      "branch": "feature/mui-v9-react-19",
+      "origin": "git@github.com:reactorynet/reactory-express-server.git",
+      "dirty": false
+    },
+    "reactory-pwa-client": {
+      "path": "reactory-pwa-client",
+      "sha": "4d9240d76982fcddb932aed1080b7d9055f67e0c",
+      "branch": "feature/mui-v9-react-19",
+      "origin": "git@github.com:reactorynet/reactory-pwa-client.git",
+      "dirty": true
+    },
+    "reactory-client-core-pwa-plugin": {
+      "path": "reactory-pwa-client/src/components/plugins/reactory-core",
+      "sha": "ff2d0b2a1ed32654b646d8bab1b5fe47b6026192",
+      "branch": "feature/mui-v9-react-19",
+      "origin": "git@github.com:reactorynet/reactory-client-core-pwa-plugin.git",
+      "dirty": false
+    },
+    "reactory-communicator-pwa-plugin": {
+      "path": "reactory-pwa-client/src/components/plugins/reactory-communicator",
+      "sha": "f35ccc185e34afbd66901646ebf11c42cf9f253b",
+      "branch": "feature/mui-v9-react-19",
+      "origin": "git@github.com:reactorynet/reactory-communicator-pwa-plugin.git",
+      "dirty": false
+    },
+    "reactory-telemetry-pwa-plugin": {
+      "path": "reactory-pwa-client/src/components/plugins/reactory-telemetry",
+      "sha": "7f85198801f14874eb7048b0074bbf58c2584483",
+      "branch": "feature/mui-v9-react-19",
+      "origin": "git@github.com:reactorynet/reactory-telemetry-pwa-plugin.git",
+      "dirty": false
+    },
+    "reactory-core": {
+      "path": "reactory-core",
+      "sha": "5f5d67bc14129c110929421e474fd6f8ede27c3f",
+      "branch": "feature/mui-v9-react-19",
+      "origin": "git@github.com:reactorynet/reactory-core.git",
+      "dirty": false
+    },
+    "reactory-data": {
+      "path": "reactory-data",
+      "sha": "a5000864bb9177d51081e6aebb9b295d60b6bcac",
+      "branch": "feature/mui-v9-react-19",
+      "origin": "git@github.com:reactorynet/reactory-data.git",
+      "dirty": false
+    },
+    "reactory-client-core-plugin": {
+      "path": "reactory-data/plugins/reactory-client-core",
+      "sha": "39b79bae2bb79cdf6f221a94d7ffffff3daf4c40",
+      "branch": "feature/mui-v9-react-19",
+      "origin": "git@github.com:reactorynet/reactory-client-core-plugin.git",
+      "dirty": false
+    },
+    "reactory-reactor": {
+      "path": "reactory-express-server/src/modules/reactory-reactor",
+      "sha": "c0a400583fbf894d30510dcc8f7786c1e6d3a881",
+      "branch": "feature/mui-v9-react-19",
+      "origin": "git@github.com:reactorynet/reactory-reactor.git",
+      "dirty": false
+    },
+    "reactory-classroom": {
+      "path": "reactory-express-server/src/modules/reactory-classroom",
+      "sha": "c8f9bca7e5d6c083498762829fab6b6538e1d0fc",
+      "branch": "feature/mui-v9-react-19",
+      "origin": "git@github.com:reactorynet/reactory-classroom.git",
+      "dirty": false
+    },
+    "reactory-socialeyes": {
+      "path": "reactory-express-server/src/modules/reactory-socialeyes",
+      "sha": "d9a87d59533e52f85b8085fcee96ec1b11ca1ef5",
+      "branch": "feature/mui-v9-react-19",
+      "origin": "git@github.com:reactorynet/reactory-socialeyes.git",
+      "dirty": false
+    }
+  }
+}
